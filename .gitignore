@@ -1,0 +1,6 @@
+# Build outputs
+/xl1b_changer
+*.o
+
+# macOS
+.DS_Store
