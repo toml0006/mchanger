@@ -999,7 +999,24 @@ static bool parse_element_status_map(const uint8_t *buf, uint32_t len, ElementMa
         if (page_end > len) page_end = len;
 
         while (offset + desc_len <= page_end) {
+            if (desc_len < 2) {
+                offset = page_end;
+                break;
+            }
             uint16_t elem_addr = (buf[offset] << 8) | buf[offset + 1];
+            if (type == 0x02 && elem_addr == 0x0000) {
+                bool all_zero = true;
+                for (uint16_t i = 0; i < desc_len; i++) {
+                    if (buf[offset + i] != 0x00) {
+                        all_zero = false;
+                        break;
+                    }
+                }
+                if (all_zero) {
+                    offset += desc_len;
+                    continue;
+                }
+            }
             if (type == 0x01) {
                 element_list_push(&map->transports, elem_addr);
             } else if (type == 0x02) {
@@ -1065,6 +1082,8 @@ static int fetch_element_map(ChangerHandle *handle, ElementMap *map) {
     uint8_t cdb[12] = {0};
     cdb[0] = 0xB8; // READ ELEMENT STATUS
     cdb[1] = 0x00; // all element types
+    cdb[4] = 0xFF; // request all available elements
+    cdb[5] = 0xFF;
     cdb[6] = (alloc >> 16) & 0xFF;
     cdb[7] = (alloc >> 8) & 0xFF;
     cdb[8] = alloc & 0xFF;
@@ -1078,6 +1097,10 @@ static int fetch_element_map(ChangerHandle *handle, ElementMap *map) {
     }
 
     uint32_t report_bytes = (buf[5] << 16) | (buf[6] << 8) | buf[7];
+    if (report_bytes == 0) {
+        free(buf);
+        return 1;
+    }
     uint32_t needed = report_bytes + 8;
     if (needed > alloc && needed < 65535) {
         free(buf);
@@ -1094,7 +1117,8 @@ static int fetch_element_map(ChangerHandle *handle, ElementMap *map) {
         }
     }
 
-    bool ok = parse_element_status_map(buf, alloc, map);
+    uint32_t parse_len = (report_bytes + 8 <= alloc) ? report_bytes + 8 : alloc;
+    bool ok = parse_element_status_map(buf, parse_len, map);
     free(buf);
     return ok ? 0 : 1;
 }
