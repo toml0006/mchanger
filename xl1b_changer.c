@@ -39,12 +39,38 @@ typedef struct {
     ElementList ie;
 } ElementMap;
 
+typedef struct {
+    uint16_t first_transport;
+    uint16_t num_transport;
+    uint16_t first_storage;
+    uint16_t num_storage;
+    uint16_t first_ie;
+    uint16_t num_ie;
+    uint16_t first_drive;
+    uint16_t num_drive;
+} ElementAddrAssignment;
+
+static ChangerHandle open_changer_scsitask(io_service_t service, const char *vendor_c, const char *product_c);
+static ChangerHandle open_sbp2_lun_from_service(io_service_t service);
+static void close_changer(ChangerHandle *handle);
+static void element_map_free(ElementMap *map);
+static int fetch_element_map(ChangerHandle *handle, ElementMap *map);
+static int cmd_mode_sense_element(ChangerHandle *handle);
+static int cmd_probe_storage(ChangerHandle *handle);
+static void parse_element_status(const uint8_t *buf, uint32_t len);
+
 static void print_usage(const char *argv0) {
     fprintf(stderr,
         "Usage:\n"
         "  %s list\n"
+        "  %s list-all\n"
+        "  %s scan-changers\n"
+        "  %s list-sbp2\n"
+        "  %s scan-sbp2\n"
         "  %s test-unit-ready\n"
         "  %s inquiry\n"
+        "  %s mode-sense-element\n"
+        "  %s probe-storage\n"
         "  %s init-status\n"
         "  %s read-element-status --element-type <all|transport|storage|ie|drive>\n"
         "                           --start <addr> --count <n> --alloc <bytes> [--raw]\n"
@@ -64,7 +90,7 @@ static void print_usage(const char *argv0) {
         "- Use --confirm to require interactive confirmation before moving media.\n"
         "- Use --debug to print IORegistry details for troubleshooting.\n"
         "- This is a stub: it sends SMC commands but does not fully parse responses.\n",
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0
     );
 }
 
@@ -89,6 +115,36 @@ static void cfstring_to_c(CFTypeRef value, char *out, size_t out_len) {
     if (!CFStringGetCString((CFStringRef)value, out, out_len, kCFStringEncodingUTF8)) {
         snprintf(out, out_len, "unknown");
     }
+}
+
+static void get_vendor_product(io_service_t service,
+                               char *vendor_c, size_t vendor_len,
+                               char *product_c, size_t product_len) {
+    CFTypeRef vendor = IORegistryEntryCreateCFProperty(service, VENDOR_KEY, kCFAllocatorDefault, 0);
+    CFTypeRef product = IORegistryEntryCreateCFProperty(service, PRODUCT_KEY, kCFAllocatorDefault, 0);
+    CFTypeRef parent_vendor = NULL;
+    CFTypeRef parent_product = NULL;
+
+    bool have_vendor = (vendor && CFGetTypeID(vendor) == CFStringGetTypeID());
+    bool have_product = (product && CFGetTypeID(product) == CFStringGetTypeID());
+    if (!have_vendor || !have_product) {
+        io_registry_entry_t parent = IO_OBJECT_NULL;
+        if (IORegistryEntryGetParentEntry(service, kIOServicePlane, &parent) == KERN_SUCCESS) {
+            parent_vendor = IORegistryEntryCreateCFProperty(parent, VENDOR_KEY, kCFAllocatorDefault, 0);
+            parent_product = IORegistryEntryCreateCFProperty(parent, PRODUCT_KEY, kCFAllocatorDefault, 0);
+            IOObjectRelease(parent);
+        }
+    }
+
+    CFTypeRef use_vendor = have_vendor ? vendor : parent_vendor;
+    CFTypeRef use_product = have_product ? product : parent_product;
+    cfstring_to_c(use_vendor, vendor_c, vendor_len);
+    cfstring_to_c(use_product, product_c, product_len);
+
+    if (vendor) CFRelease(vendor);
+    if (product) CFRelease(product);
+    if (parent_vendor) CFRelease(parent_vendor);
+    if (parent_product) CFRelease(parent_product);
 }
 
 static bool is_changer_device(io_service_t service) {
@@ -245,6 +301,222 @@ static void list_changers(void) {
         if (vendor) CFRelease(vendor);
         if (product) CFRelease(product);
         IOObjectRelease(service);
+    }
+    IOObjectRelease(iter);
+
+    if (count == 0) {
+        printf("No SCSI changer devices (device type 8) found.\n");
+    }
+}
+
+static void list_all_scsi_devices(void) {
+    io_iterator_t iter = match_scsi_devices();
+    if (iter == IO_OBJECT_NULL) return;
+
+    io_service_t service;
+    int count = 0;
+    while ((service = IOIteratorNext(iter))) {
+        CFTypeRef vendor = IORegistryEntryCreateCFProperty(service, VENDOR_KEY, kCFAllocatorDefault, 0);
+        CFTypeRef product = IORegistryEntryCreateCFProperty(service, PRODUCT_KEY, kCFAllocatorDefault, 0);
+        char vendor_c[128];
+        char product_c[128];
+        cfstring_to_c(vendor, vendor_c, sizeof(vendor_c));
+        cfstring_to_c(product, product_c, sizeof(product_c));
+
+        char path[512];
+        path[0] = '\0';
+        IORegistryEntryGetPath(service, kIOServicePlane, path);
+
+        printf("SCSI Device %d:\n", ++count);
+        printf("  Vendor:  %s\n", vendor_c);
+        printf("  Product: %s\n", product_c);
+        printf("  Type8:   %s\n", is_changer_device(service) ? "yes" : "no");
+        printf("  Path:    %s\n", path[0] ? path : "(unknown)");
+
+        if (vendor) CFRelease(vendor);
+        if (product) CFRelease(product);
+        IOObjectRelease(service);
+    }
+    IOObjectRelease(iter);
+
+    if (count == 0) {
+        printf("No SCSI peripheral devices found.\n");
+    }
+}
+
+static uint64_t get_cfnumber_u64(CFTypeRef value, bool *ok_out) {
+    if (ok_out) *ok_out = false;
+    if (!value || CFGetTypeID(value) != CFNumberGetTypeID()) return 0;
+    uint64_t out = 0;
+    if (CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &out)) {
+        if (ok_out) *ok_out = true;
+        return out;
+    }
+    return 0;
+}
+
+static void list_sbp2_luns(void) {
+    io_iterator_t iter = IO_OBJECT_NULL;
+    CFMutableDictionaryRef match = IOServiceMatching("IOFireWireSBP2LUN");
+    if (!match) {
+        fprintf(stderr, "Failed to create IOFireWireSBP2LUN match dictionary.\n");
+        return;
+    }
+    kern_return_t kr = IOServiceGetMatchingServices(kIOMasterPortDefault, match, &iter);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "IOServiceGetMatchingServices failed: 0x%x\n", kr);
+        return;
+    }
+
+    io_service_t service;
+    int count = 0;
+    while ((service = IOIteratorNext(iter))) {
+        CFTypeRef lun_prop = IORegistryEntryCreateCFProperty(service, CFSTR("LUN"), kCFAllocatorDefault, 0);
+        CFTypeRef sbp2_lun_prop = IORegistryEntryCreateCFProperty(service, CFSTR("SBP2LUN"), kCFAllocatorDefault, 0);
+        char vendor_c[128];
+        char product_c[128];
+        get_vendor_product(service, vendor_c, sizeof(vendor_c), product_c, sizeof(product_c));
+
+        char path[512];
+        path[0] = '\0';
+        IORegistryEntryGetPath(service, kIOServicePlane, path);
+
+        uint64_t entry_id = 0;
+        IORegistryEntryGetRegistryEntryID(service, &entry_id);
+
+        printf("SBP2 LUN %d:\n", ++count);
+        printf("  Vendor:  %s\n", vendor_c);
+        printf("  Product: %s\n", product_c);
+        printf("  EntryID: 0x%llx\n", (unsigned long long)entry_id);
+        bool lun_ok = false;
+        uint64_t lun = get_cfnumber_u64(lun_prop, &lun_ok);
+        bool sbp2_ok = false;
+        uint64_t sbp2_lun = get_cfnumber_u64(sbp2_lun_prop, &sbp2_ok);
+        if (lun_ok) {
+            printf("  LUN:     %llu\n", (unsigned long long)lun);
+        }
+        if (sbp2_ok) {
+            printf("  SBP2LUN: %llu\n", (unsigned long long)sbp2_lun);
+        }
+        printf("  Path:    %s\n", path[0] ? path : "(unknown)");
+
+        if (lun_prop) CFRelease(lun_prop);
+        if (sbp2_lun_prop) CFRelease(sbp2_lun_prop);
+        IOObjectRelease(service);
+    }
+    IOObjectRelease(iter);
+
+    if (count == 0) {
+        printf("No SBP2 LUN services found.\n");
+    }
+}
+
+static void scan_sbp2_luns(void) {
+    io_iterator_t iter = IO_OBJECT_NULL;
+    CFMutableDictionaryRef match = IOServiceMatching("IOFireWireSBP2LUN");
+    if (!match) {
+        fprintf(stderr, "Failed to create IOFireWireSBP2LUN match dictionary.\n");
+        return;
+    }
+    kern_return_t kr = IOServiceGetMatchingServices(kIOMasterPortDefault, match, &iter);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "IOServiceGetMatchingServices failed: 0x%x\n", kr);
+        return;
+    }
+
+    io_service_t service;
+    int count = 0;
+    while ((service = IOIteratorNext(iter))) {
+        char vendor_c[128];
+        char product_c[128];
+        get_vendor_product(service, vendor_c, sizeof(vendor_c), product_c, sizeof(product_c));
+
+        char path[512];
+        path[0] = '\0';
+        IORegistryEntryGetPath(service, kIOServicePlane, path);
+
+        uint64_t entry_id = 0;
+        IORegistryEntryGetRegistryEntryID(service, &entry_id);
+
+        printf("SBP2 LUN %d:\n", ++count);
+        printf("  Vendor:  %s\n", vendor_c);
+        printf("  Product: %s\n", product_c);
+        printf("  EntryID: 0x%llx\n", (unsigned long long)entry_id);
+        printf("  Path:    %s\n", path[0] ? path : "(unknown)");
+
+        ChangerHandle handle = open_sbp2_lun_from_service(service);
+        if (handle.sbp2_login) {
+            ElementMap map = {0};
+            int rc = fetch_element_map(&handle, &map);
+            if (rc == 0) {
+                printf("  Elements: transports=%zu slots=%zu drives=%zu ie=%zu\n",
+                       map.transports.count, map.slots.count, map.drives.count, map.ie.count);
+            } else {
+                printf("  Elements: failed to read element map\n");
+            }
+            element_map_free(&map);
+            close_changer(&handle);
+        } else {
+            printf("  Elements: unable to open SBP2 login\n");
+            IOObjectRelease(service);
+        }
+
+    }
+    IOObjectRelease(iter);
+
+    if (count == 0) {
+        printf("No SBP2 LUN services found.\n");
+    }
+}
+
+static void scan_changers(void) {
+    io_iterator_t iter = match_scsi_devices();
+    if (iter == IO_OBJECT_NULL) return;
+
+    io_service_t service;
+    int count = 0;
+    while ((service = IOIteratorNext(iter))) {
+        if (!is_changer_device(service)) {
+            IOObjectRelease(service);
+            continue;
+        }
+        CFTypeRef vendor = IORegistryEntryCreateCFProperty(service, VENDOR_KEY, kCFAllocatorDefault, 0);
+        CFTypeRef product = IORegistryEntryCreateCFProperty(service, PRODUCT_KEY, kCFAllocatorDefault, 0);
+        char vendor_c[128];
+        char product_c[128];
+        cfstring_to_c(vendor, vendor_c, sizeof(vendor_c));
+        cfstring_to_c(product, product_c, sizeof(product_c));
+
+        char path[512];
+        path[0] = '\0';
+        IORegistryEntryGetPath(service, kIOServicePlane, path);
+
+        printf("Changer %d:\n", ++count);
+        printf("  Vendor:  %s\n", vendor_c);
+        printf("  Product: %s\n", product_c);
+        printf("  Path:    %s\n", path[0] ? path : "(unknown)");
+
+        ChangerHandle handle = open_changer_scsitask(service, vendor_c, product_c);
+        if (handle.scsi_device) {
+            ElementMap map = {0};
+            int rc = fetch_element_map(&handle, &map);
+            if (rc == 0) {
+                printf("  Elements: transports=%zu slots=%zu drives=%zu ie=%zu\n",
+                       map.transports.count, map.slots.count, map.drives.count, map.ie.count);
+            } else {
+                printf("  Elements: failed to read element map\n");
+            }
+            element_map_free(&map);
+            close_changer(&handle);
+        } else {
+            printf("  Elements: unable to open SCSITask user client\n");
+            if (handle.service) {
+                IOObjectRelease(handle.service);
+            }
+        }
+
+        if (vendor) CFRelease(vendor);
+        if (product) CFRelease(product);
     }
     IOObjectRelease(iter);
 
@@ -453,12 +725,12 @@ static bool runloop_wait(bool *done_flag, double timeout_seconds) {
     return true;
 }
 
-static ChangerHandle open_changer_sbp2(const char *vendor_c, const char *product_c) {
+static ChangerHandle open_sbp2_lun_from_service(io_service_t service) {
     ChangerHandle handle = {0};
     handle.backend = BACKEND_SBP2;
-    handle.service = find_sbp2_lun_service(vendor_c, product_c);
+    handle.service = service;
     if (handle.service == IO_OBJECT_NULL) {
-        fprintf(stderr, "No SBP2 LUN service found for %s %s.\n", vendor_c, product_c);
+        fprintf(stderr, "No SBP2 LUN service provided.\n");
         return handle;
     }
 
@@ -562,6 +834,16 @@ static ChangerHandle open_changer_sbp2(const char *vendor_c, const char *product
     }
 
     return handle;
+}
+
+static ChangerHandle open_changer_sbp2(const char *vendor_c, const char *product_c) {
+    io_service_t service = find_sbp2_lun_service(vendor_c, product_c);
+    if (service == IO_OBJECT_NULL) {
+        fprintf(stderr, "No SBP2 LUN service found for %s %s.\n", vendor_c, product_c);
+        ChangerHandle empty = {0};
+        return empty;
+    }
+    return open_sbp2_lun_from_service(service);
 }
 
 static ChangerHandle open_changer(bool require_sony) {
@@ -871,6 +1153,133 @@ static int cmd_inquiry(ChangerHandle *handle) {
         dump_hex(buf, sizeof(buf));
     }
     return rc;
+}
+
+static int read_mode_sense_element(ChangerHandle *handle, ElementAddrAssignment *out, bool print) {
+    uint8_t cdb[10] = {0};
+    cdb[0] = 0x5A; // MODE SENSE(10)
+    cdb[1] = 0x08; // DBD=1 (disable block descriptors)
+    cdb[2] = 0x1D; // Element Address Assignment page
+    cdb[3] = 0x00; // subpage
+    uint16_t alloc = 256;
+    cdb[7] = (alloc >> 8) & 0xFF;
+    cdb[8] = alloc & 0xFF;
+
+    uint8_t buf[256];
+    memset(buf, 0, sizeof(buf));
+    int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 10000);
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (alloc < 8) {
+        fprintf(stderr, "MODE SENSE response too short.\n");
+        return 1;
+    }
+
+    uint16_t mode_data_length = (buf[0] << 8) | buf[1];
+    uint16_t block_desc_len = (buf[6] << 8) | buf[7];
+    uint32_t page_offset = 8 + block_desc_len;
+    if (page_offset + 2 > alloc) {
+        fprintf(stderr, "MODE SENSE page offset out of range.\n");
+        return 1;
+    }
+
+    uint8_t page_code = buf[page_offset] & 0x3F;
+    uint8_t page_len = buf[page_offset + 1];
+    if (print) {
+        printf("Mode Sense (Element Address Assignment):\n");
+        printf("  Mode Data Length: %u\n", mode_data_length);
+        printf("  Page Code: 0x%02x Length: %u\n", page_code, page_len);
+    }
+
+    if (page_code != 0x1D || page_len < 16) {
+        if (print) {
+            printf("  Unexpected page code/length; dumping raw page bytes.\n");
+            dump_hex(&buf[page_offset], (size_t)page_len + 2);
+        }
+        return 0;
+    }
+
+    const uint8_t *p = &buf[page_offset + 2];
+    if (out) {
+        out->first_transport = (p[0] << 8) | p[1];
+        out->num_transport = (p[2] << 8) | p[3];
+        out->first_storage = (p[4] << 8) | p[5];
+        out->num_storage = (p[6] << 8) | p[7];
+        out->first_ie = (p[8] << 8) | p[9];
+        out->num_ie = (p[10] << 8) | p[11];
+        out->first_drive = (p[12] << 8) | p[13];
+        out->num_drive = (p[14] << 8) | p[15];
+    }
+
+    if (print && out) {
+        printf("  Transport: first=0x%04x count=%u\n", out->first_transport, out->num_transport);
+        printf("  Storage:   first=0x%04x count=%u\n", out->first_storage, out->num_storage);
+        printf("  IE:        first=0x%04x count=%u\n", out->first_ie, out->num_ie);
+        printf("  Drive:     first=0x%04x count=%u\n", out->first_drive, out->num_drive);
+    }
+    return 0;
+}
+
+static int cmd_mode_sense_element(ChangerHandle *handle) {
+    ElementAddrAssignment assign = {0};
+    return read_mode_sense_element(handle, &assign, true);
+}
+
+static int cmd_probe_storage(ChangerHandle *handle) {
+    ElementAddrAssignment assign = {0};
+    int rc = read_mode_sense_element(handle, &assign, true);
+    if (rc != 0) return rc;
+
+    if (assign.num_storage == 0) {
+        fprintf(stderr, "No storage elements reported by MODE SENSE.\n");
+        return 1;
+    }
+
+    uint16_t step = (assign.num_storage > 40) ? 40 : assign.num_storage;
+    uint32_t alloc = 4096;
+    uint8_t *buf = calloc(1, alloc);
+    if (!buf) {
+        fprintf(stderr, "Allocation failed.\n");
+        return 1;
+    }
+
+    printf("\nProbing READ ELEMENT STATUS ranges (storage):\n");
+    for (uint16_t offset = 0; offset < assign.num_storage; offset += step) {
+        uint16_t start = assign.first_storage + offset;
+        uint16_t count = assign.num_storage - offset;
+        if (count > step) count = step;
+
+        uint8_t cdb[12] = {0};
+        cdb[0] = 0xB8; // READ ELEMENT STATUS
+        cdb[1] = 0x02; // storage
+        cdb[2] = (start >> 8) & 0xFF;
+        cdb[3] = start & 0xFF;
+        cdb[4] = (count >> 8) & 0xFF;
+        cdb[5] = count & 0xFF;
+        cdb[6] = (alloc >> 16) & 0xFF;
+        cdb[7] = (alloc >> 8) & 0xFF;
+        cdb[8] = alloc & 0xFF;
+
+        memset(buf, 0, alloc);
+        rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 30000);
+        if (rc != 0) {
+            printf("  start=0x%04x count=%u -> error\n", start, count);
+            continue;
+        }
+        uint16_t first_elem = (buf[0] << 8) | buf[1];
+        uint16_t num_elem = (buf[2] << 8) | buf[3];
+        uint32_t report_bytes = (buf[5] << 16) | (buf[6] << 8) | buf[7];
+        printf("  start=0x%04x count=%u -> header first=0x%04x num=%u bytes=%u\n",
+               start, count, first_elem, num_elem, report_bytes);
+        if (report_bytes > 0) {
+            parse_element_status(buf, alloc);
+        }
+    }
+
+    free(buf);
+    return 0;
 }
 
 static int cmd_test_unit_ready(ChangerHandle *handle) {
@@ -1227,6 +1636,22 @@ int main(int argc, char **argv) {
         list_changers();
         return 0;
     }
+    if (strcmp(argv[1], "list-all") == 0) {
+        list_all_scsi_devices();
+        return 0;
+    }
+    if (strcmp(argv[1], "scan-changers") == 0) {
+        scan_changers();
+        return 0;
+    }
+    if (strcmp(argv[1], "list-sbp2") == 0) {
+        list_sbp2_luns();
+        return 0;
+    }
+    if (strcmp(argv[1], "scan-sbp2") == 0) {
+        scan_sbp2_luns();
+        return 0;
+    }
 
     ChangerHandle handle = open_changer(!force);
     if ((handle.backend == BACKEND_SCSITASK && !handle.scsi_device) ||
@@ -1259,6 +1684,10 @@ int main(int argc, char **argv) {
         rc = cmd_test_unit_ready(&handle);
     } else if (strcmp(argv[1], "inquiry") == 0) {
         rc = cmd_inquiry(&handle);
+    } else if (strcmp(argv[1], "mode-sense-element") == 0) {
+        rc = cmd_mode_sense_element(&handle);
+    } else if (strcmp(argv[1], "probe-storage") == 0) {
+        rc = cmd_probe_storage(&handle);
     } else if (strcmp(argv[1], "init-status") == 0) {
         rc = cmd_init_status(&handle);
     } else if (strcmp(argv[1], "read-element-status") == 0) {
