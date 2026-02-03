@@ -1053,7 +1053,23 @@ static int cmd_read_element_status(ChangerHandle *handle, uint8_t element_type, 
         fprintf(stderr, "Allocation failed.\n");
         return 1;
     }
+
     int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 30000);
+    if (rc != 0 && element_type != 0x00) {
+        fprintf(stderr, "READ ELEMENT STATUS failed for type '%s'; retrying with element-type=all.\n",
+                element_type_name(element_type));
+        memset(cdb, 0, sizeof(cdb));
+        cdb[0] = 0xB8; // READ ELEMENT STATUS
+        cdb[1] = 0x00; // all element types
+        cdb[4] = 0xFF;
+        cdb[5] = 0xFF;
+        cdb[6] = (alloc >> 16) & 0xFF;
+        cdb[7] = (alloc >> 8) & 0xFF;
+        cdb[8] = alloc & 0xFF;
+        memset(buf, 0, alloc);
+        rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 30000);
+    }
+
     if (rc == 0) {
         parse_element_status(buf, alloc);
         if (dump_raw) {
