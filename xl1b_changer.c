@@ -1568,6 +1568,21 @@ static void print_element_map(const ElementMap *map) {
     }
 }
 
+static void warn_if_slot_mismatch(ChangerHandle *handle, const ElementMap *map) {
+    if (!handle || !map) return;
+    ElementAddrAssignment assign = {0};
+    if (read_mode_sense_element(handle, &assign, false) != 0) {
+        return;
+    }
+    if (assign.num_storage > 0 && map->slots.count > 0 &&
+        assign.num_storage != map->slots.count) {
+        fprintf(stderr,
+                "Warning: MODE SENSE reports %u storage elements, "
+                "but READ ELEMENT STATUS returned %zu slots.\n",
+                assign.num_storage, map->slots.count);
+    }
+}
+
 static bool parse_u16(const char *s, uint16_t *out) {
     if (!s || !out) return false;
     char *end = NULL;
@@ -1757,6 +1772,7 @@ int main(int argc, char **argv) {
         rc = fetch_element_map(&handle, &map);
         if (rc == 0) {
             print_element_map(&map);
+            warn_if_slot_mismatch(&handle, &map);
         } else {
             fprintf(stderr, "Failed to read element map.\n");
         }
