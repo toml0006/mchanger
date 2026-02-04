@@ -149,6 +149,20 @@ The tool communicates with the media changer using SCSI Media Changer (SMC) comm
 
 For FireWire devices, it uses the IOFireWireSBP2 interface to send SCSI commands over the Serial Bus Protocol.
 
+## Supported Connections
+
+**Currently implemented:**
+- FireWire (IEEE 1394) via IOFireWireSBP2
+
+**Theoretically supported** (contributions welcome):
+- USB Mass Storage (if the changer exposes SCSI commands)
+- SAS (Serial Attached SCSI)
+- Thunderbolt via SAS adapters
+- Fibre Channel
+- iSCSI
+
+The SCSI commands are transport-agnostic—the same READ ELEMENT STATUS and MOVE MEDIUM commands work regardless of how the device is connected. Only the device discovery layer is currently FireWire-specific. Adding support for other transports would require extending `mchanger_list_changers()` to search additional IOKit device classes.
+
 ## License
 
 MIT License - See LICENSE file for details.
