@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal binary
+        run: |
+          cc -Wall -Wextra -O2 -arch arm64 -arch x86_64 \
+            -o mchanger mchanger.c \
+            -framework CoreFoundation \
+            -framework IOKit \
+            -framework DiskArbitration
+
+      - name: Verify universal binary
+        run: |
+          file mchanger
+          lipo -info mchanger
+
+      - name: Create tarball
+        run: |
+          tar -czvf mchanger-${{ github.ref_name }}-macos-universal.tar.gz mchanger
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: mchanger-${{ github.ref_name }}-macos-universal.tar.gz
