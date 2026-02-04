@@ -1,0 +1,25 @@
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CLI
+        run: make
+
+      - name: Build library
+        run: make lib
+
+      - name: Verify build artifacts
+        run: |
+          test -x mchanger
+          test -f libmchanger.a
+          ./mchanger --help
