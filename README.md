@@ -1,4 +1,4 @@
-# xl1b_changer
+# mchanger
 
 A command-line tool to control SCSI media changer devices (jukeboxes/autoloaders) on macOS. Originally developed for the Sony VGP-XL1B disc changer but should work with other SCSI-compliant media changers.
 
@@ -28,7 +28,7 @@ make
 Or manually:
 
 ```sh
-cc -Wall -Wextra -O2 -o xl1b_changer xl1b_changer.c \
+cc -Wall -Wextra -O2 -o mchanger mchanger.c \
   -framework CoreFoundation \
   -framework IOKit \
   -framework DiskArbitration
@@ -42,24 +42,24 @@ To build as a static library (for use in other applications):
 make lib
 ```
 
-This creates `libxl1b_changer.a`. Link against it and include `xl1b_changer.h`:
+This creates `libmchanger.a`. Link against it and include `mchanger.h`:
 
 ```c
-#include "xl1b_changer.h"
+#include "mchanger.h"
 
 // Open the changer
-XL1BChanger *changer = xl1b_open(NULL);
+MChangerHandle *changer = mchanger_open(NULL);
 
 // Load slot 1 into the drive
-xl1b_load_slot(changer, 1, 1);
+mchanger_load_slot(changer, 1, 1);
 
 // Close when done
-xl1b_close(changer);
+mchanger_close(changer);
 ```
 
 Link with:
 ```sh
-cc -o myapp myapp.c -L. -lxl1b_changer \
+cc -o myapp myapp.c -L. -lmchanger \
   -framework CoreFoundation -framework IOKit -framework DiskArbitration
 ```
 
@@ -68,17 +68,17 @@ cc -o myapp myapp.c -L. -lxl1b_changer \
 ### List available changers
 
 ```sh
-./xl1b_changer list          # List changers with brief info
-./xl1b_changer list-all      # List all changers including non-standard
-./xl1b_changer list-map      # Show element addresses (slots, drives, etc.)
+./mchanger list          # List changers with brief info
+./mchanger list-all      # List all changers including non-standard
+./mchanger list-map      # Show element addresses (slots, drives, etc.)
 ```
 
 ### Load a disc into the drive
 
 ```sh
-./xl1b_changer load-slot --slot 1              # Load slot 1 into drive
-./xl1b_changer load-slot --slot 2 -v           # Load slot 2 with verbose output
-./xl1b_changer load-slot --slot 1 --dry-run    # Show what would happen
+./mchanger load-slot --slot 1              # Load slot 1 into drive
+./mchanger load-slot --slot 2 -v           # Load slot 2 with verbose output
+./mchanger load-slot --slot 1 --dry-run    # Show what would happen
 ```
 
 If a disc is already in the drive, it will automatically be unloaded to its original slot first.
@@ -86,13 +86,13 @@ If a disc is already in the drive, it will automatically be unloaded to its orig
 ### Unload the drive
 
 ```sh
-./xl1b_changer unload-drive --slot 1           # Unload drive to slot 1
+./mchanger unload-drive --slot 1           # Unload drive to slot 1
 ```
 
 ### Eject a disc from the machine
 
 ```sh
-./xl1b_changer eject --slot 1                  # Eject disc from slot 1 to I/E slot
+./mchanger eject --slot 1                  # Eject disc from slot 1 to I/E slot
 ```
 
 If the disc is currently in the drive, it will be unloaded first, then moved to the import/export slot where you can physically remove it.
@@ -100,10 +100,10 @@ If the disc is currently in the drive, it will be unloaded first, then moved to 
 ### Device information
 
 ```sh
-./xl1b_changer inquiry                         # Show device inquiry data
-./xl1b_changer test-unit-ready                 # Check if device is ready
-./xl1b_changer mode-sense-element              # Show element address assignment
-./xl1b_changer read-element-status --element-type all --start 0 --count 50 --alloc 4096
+./mchanger inquiry                         # Show device inquiry data
+./mchanger test-unit-ready                 # Check if device is ready
+./mchanger mode-sense-element              # Show element address assignment
+./mchanger read-element-status --element-type all --start 0 --count 50 --alloc 4096
 ```
 
 ## Options

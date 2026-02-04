@@ -1,12 +1,12 @@
 /*
- * xl1b_changer - SCSI Media Changer Library and CLI
+ * mchanger - SCSI Media Changer Library and CLI
  *
  * A library/tool to control SCSI media changer devices on macOS.
  *
  * MIT License - Copyright (c) 2026 Jackson
  */
 
-#include "xl1b_changer.h"
+#include "mchanger.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -2034,11 +2034,11 @@ static bool confirm_move(void) {
 
 /*
  * =============================================================================
- * CLI Main (excluded when building as library with -DXL1B_NO_MAIN)
+ * CLI Main (excluded when building as library with -DMCHANGER_NO_MAIN)
  * =============================================================================
  */
 
-#ifndef XL1B_NO_MAIN
+#ifndef MCHANGER_NO_MAIN
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -2641,7 +2641,7 @@ out:
     return rc;
 }
 
-#endif /* XL1B_NO_MAIN */
+#endif /* MCHANGER_NO_MAIN */
 
 /*
  * =============================================================================
@@ -2650,19 +2650,19 @@ out:
  */
 
 /* Internal handle is compatible with public handle */
-struct XL1BChanger {
+struct MChangerHandle {
     ChangerHandle internal;
 };
 
 /* List available changer devices */
-int xl1b_list_changers(XL1BChangerInfo **out_list, size_t *out_count) {
-    if (!out_list || !out_count) return XL1B_ERR_INVALID;
+int mchanger_list_changers(MChangerHandleInfo **out_list, size_t *out_count) {
+    if (!out_list || !out_count) return MCHANGER_ERR_INVALID;
 
     *out_list = NULL;
     *out_count = 0;
 
     io_iterator_t iter = match_scsi_devices();
-    if (iter == IO_OBJECT_NULL) return XL1B_ERR_NOT_FOUND;
+    if (iter == IO_OBJECT_NULL) return MCHANGER_ERR_NOT_FOUND;
 
     /* Count changers first */
     size_t count = 0;
@@ -2674,14 +2674,14 @@ int xl1b_list_changers(XL1BChangerInfo **out_list, size_t *out_count) {
 
     if (count == 0) {
         IOObjectRelease(iter);
-        return XL1B_OK; /* No changers found, but not an error */
+        return MCHANGER_OK; /* No changers found, but not an error */
     }
 
     /* Allocate and fill */
-    XL1BChangerInfo *list = calloc(count, sizeof(XL1BChangerInfo));
+    MChangerHandleInfo *list = calloc(count, sizeof(MChangerHandleInfo));
     if (!list) {
         IOObjectRelease(iter);
-        return XL1B_ERR_INVALID;
+        return MCHANGER_ERR_INVALID;
     }
 
     IOIteratorReset(iter);
@@ -2702,22 +2702,22 @@ int xl1b_list_changers(XL1BChangerInfo **out_list, size_t *out_count) {
 
     *out_list = list;
     *out_count = idx;
-    return XL1B_OK;
+    return MCHANGER_OK;
 }
 
-void xl1b_free_changer_list(XL1BChangerInfo *list) {
+void mchanger_free_changer_list(MChangerHandleInfo *list) {
     free(list);
 }
 
 /* Open a changer device */
-XL1BChanger *xl1b_open(const char *device_name) {
-    return xl1b_open_ex(device_name, false, false);
+MChangerHandle *mchanger_open(const char *device_name) {
+    return mchanger_open_ex(device_name, false, false);
 }
 
-XL1BChanger *xl1b_open_ex(const char *device_name, bool force, bool skip_tur) {
+MChangerHandle *mchanger_open_ex(const char *device_name, bool force, bool skip_tur) {
     (void)device_name; /* TODO: support opening specific device by name */
 
-    XL1BChanger *changer = calloc(1, sizeof(XL1BChanger));
+    MChangerHandle *changer = calloc(1, sizeof(MChangerHandle));
     if (!changer) return NULL;
 
     changer->internal = open_changer(!force);
@@ -2737,21 +2737,21 @@ XL1BChanger *xl1b_open_ex(const char *device_name, bool force, bool skip_tur) {
     return changer;
 }
 
-void xl1b_close(XL1BChanger *changer) {
+void mchanger_close(MChangerHandle *changer) {
     if (!changer) return;
     close_changer(&changer->internal);
     free(changer);
 }
 
 /* Get element map */
-int xl1b_get_element_map(XL1BChanger *changer, XL1BElementMap *out_map) {
-    if (!changer || !out_map) return XL1B_ERR_INVALID;
+int mchanger_get_element_map(MChangerHandle *changer, MChangerElementMap *out_map) {
+    if (!changer || !out_map) return MCHANGER_ERR_INVALID;
 
     memset(out_map, 0, sizeof(*out_map));
 
     ElementMap internal_map = {0};
     int rc = fetch_element_map(&changer->internal, &internal_map);
-    if (rc != 0) return XL1B_ERR_SCSI;
+    if (rc != 0) return MCHANGER_ERR_SCSI;
 
     /* Copy to public structure */
     if (internal_map.slots.count > 0) {
@@ -2791,10 +2791,10 @@ int xl1b_get_element_map(XL1BChanger *changer, XL1BElementMap *out_map) {
     }
 
     element_map_free(&internal_map);
-    return XL1B_OK;
+    return MCHANGER_OK;
 }
 
-void xl1b_free_element_map(XL1BElementMap *map) {
+void mchanger_free_element_map(MChangerElementMap *map) {
     if (!map) return;
     free(map->slot_addrs);
     free(map->drive_addrs);
@@ -2804,15 +2804,15 @@ void xl1b_free_element_map(XL1BElementMap *map) {
 }
 
 /* Get element status */
-int xl1b_get_slot_status(XL1BChanger *changer, int slot, XL1BElementStatus *out_status) {
-    if (!changer || !out_status || slot < 1) return XL1B_ERR_INVALID;
+int mchanger_get_slot_status(MChangerHandle *changer, int slot, MChangerElementStatus *out_status) {
+    if (!changer || !out_status || slot < 1) return MCHANGER_ERR_INVALID;
 
     ElementMap map = {0};
-    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+    if (fetch_element_map(&changer->internal, &map) != 0) return MCHANGER_ERR_SCSI;
 
     if ((size_t)slot > map.slots.count) {
         element_map_free(&map);
-        return XL1B_ERR_INVALID;
+        return MCHANGER_ERR_INVALID;
     }
 
     uint16_t slot_addr = map.slots.addrs[slot - 1];
@@ -2822,7 +2822,7 @@ int xl1b_get_slot_status(XL1BChanger *changer, int slot, XL1BElementStatus *out_
     int rc = read_element_status_info(&changer->internal, drive_addr, NULL, slot_addr, &internal_st);
     element_map_free(&map);
 
-    if (rc != 0) return XL1B_ERR_SCSI;
+    if (rc != 0) return MCHANGER_ERR_SCSI;
 
     out_status->address = internal_st.addr;
     out_status->full = internal_st.full;
@@ -2830,18 +2830,18 @@ int xl1b_get_slot_status(XL1BChanger *changer, int slot, XL1BElementStatus *out_
     out_status->valid_source = internal_st.valid_src;
     out_status->source_addr = internal_st.src_addr;
 
-    return XL1B_OK;
+    return MCHANGER_OK;
 }
 
-int xl1b_get_drive_status(XL1BChanger *changer, int drive, XL1BElementStatus *out_status) {
-    if (!changer || !out_status || drive < 1) return XL1B_ERR_INVALID;
+int mchanger_get_drive_status(MChangerHandle *changer, int drive, MChangerElementStatus *out_status) {
+    if (!changer || !out_status || drive < 1) return MCHANGER_ERR_INVALID;
 
     ElementMap map = {0};
-    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+    if (fetch_element_map(&changer->internal, &map) != 0) return MCHANGER_ERR_SCSI;
 
     if ((size_t)drive > map.drives.count) {
         element_map_free(&map);
-        return XL1B_ERR_INVALID;
+        return MCHANGER_ERR_INVALID;
     }
 
     uint16_t drive_addr = map.drives.addrs[drive - 1];
@@ -2850,7 +2850,7 @@ int xl1b_get_drive_status(XL1BChanger *changer, int drive, XL1BElementStatus *ou
     int rc = read_element_status_info(&changer->internal, drive_addr, &internal_st, 0, NULL);
     element_map_free(&map);
 
-    if (rc != 0) return XL1B_ERR_SCSI;
+    if (rc != 0) return MCHANGER_ERR_SCSI;
 
     out_status->address = internal_st.addr;
     out_status->full = internal_st.full;
@@ -2858,24 +2858,24 @@ int xl1b_get_drive_status(XL1BChanger *changer, int drive, XL1BElementStatus *ou
     out_status->valid_source = internal_st.valid_src;
     out_status->source_addr = internal_st.src_addr;
 
-    return XL1B_OK;
+    return MCHANGER_OK;
 }
 
 /* Load a disc from slot into drive */
-int xl1b_load_slot(XL1BChanger *changer, int slot, int drive) {
-    return xl1b_load_slot_verbose(changer, slot, drive, NULL, NULL);
+int mchanger_load_slot(MChangerHandle *changer, int slot, int drive) {
+    return mchanger_load_slot_verbose(changer, slot, drive, NULL, NULL);
 }
 
-int xl1b_load_slot_verbose(XL1BChanger *changer, int slot, int drive,
-                           XL1BMountCallback callback, void *context) {
-    if (!changer || slot < 1 || drive < 1) return XL1B_ERR_INVALID;
+int mchanger_load_slot_verbose(MChangerHandle *changer, int slot, int drive,
+                           MChangerMountCallback callback, void *context) {
+    if (!changer || slot < 1 || drive < 1) return MCHANGER_ERR_INVALID;
 
     ElementMap map = {0};
-    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+    if (fetch_element_map(&changer->internal, &map) != 0) return MCHANGER_ERR_SCSI;
 
     if ((size_t)slot > map.slots.count || (size_t)drive > map.drives.count) {
         element_map_free(&map);
-        return XL1B_ERR_INVALID;
+        return MCHANGER_ERR_INVALID;
     }
 
     uint16_t transport = map.transports.count > 0 ? map.transports.addrs[0] : 0;
@@ -2886,19 +2886,19 @@ int xl1b_load_slot_verbose(XL1BChanger *changer, int slot, int drive,
     ElementStatus drive_st = {0}, slot_st = {0};
     if (read_element_status_info(&changer->internal, drive_addr, &drive_st, slot_addr, &slot_st) != 0) {
         element_map_free(&map);
-        return XL1B_ERR_SCSI;
+        return MCHANGER_ERR_SCSI;
     }
 
     /* Already loaded? */
     if (!slot_st.full && drive_st.full && drive_st.valid_src && drive_st.src_addr == slot_addr) {
         element_map_free(&map);
-        return XL1B_OK;
+        return MCHANGER_OK;
     }
 
     /* Slot empty and disc not in drive? */
     if (!slot_st.full && !(drive_st.full && drive_st.valid_src && drive_st.src_addr == slot_addr)) {
         element_map_free(&map);
-        return XL1B_ERR_EMPTY;
+        return MCHANGER_ERR_EMPTY;
     }
 
     int rc = 0;
@@ -2910,7 +2910,7 @@ int xl1b_load_slot_verbose(XL1BChanger *changer, int slot, int drive,
         rc = cmd_move_medium(&changer->internal, transport, drive_addr, unload_addr);
         if (rc != 0) {
             element_map_free(&map);
-            return XL1B_ERR_SCSI;
+            return MCHANGER_ERR_SCSI;
         }
     }
 
@@ -2918,28 +2918,28 @@ int xl1b_load_slot_verbose(XL1BChanger *changer, int slot, int drive,
     rc = cmd_move_medium(&changer->internal, transport, slot_addr, drive_addr);
     element_map_free(&map);
 
-    if (rc != 0) return XL1B_ERR_SCSI;
+    if (rc != 0) return MCHANGER_ERR_SCSI;
 
     /* Notify about mounted disc if callback provided */
     if (callback) {
         char name[256] = {0}, size[64] = {0};
-        xl1b_wait_for_mount(name, sizeof(name), size, sizeof(size), 30);
+        mchanger_wait_for_mount(name, sizeof(name), size, sizeof(size), 30);
         callback(name[0] ? name : "Unknown", size[0] ? size : "?", context);
     }
 
-    return XL1B_OK;
+    return MCHANGER_OK;
 }
 
 /* Unload the drive to a specific slot */
-int xl1b_unload_drive(XL1BChanger *changer, int slot, int drive) {
-    if (!changer || slot < 1 || drive < 1) return XL1B_ERR_INVALID;
+int mchanger_unload_drive(MChangerHandle *changer, int slot, int drive) {
+    if (!changer || slot < 1 || drive < 1) return MCHANGER_ERR_INVALID;
 
     ElementMap map = {0};
-    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+    if (fetch_element_map(&changer->internal, &map) != 0) return MCHANGER_ERR_SCSI;
 
     if ((size_t)slot > map.slots.count || (size_t)drive > map.drives.count) {
         element_map_free(&map);
-        return XL1B_ERR_INVALID;
+        return MCHANGER_ERR_INVALID;
     }
 
     uint16_t transport = map.transports.count > 0 ? map.transports.addrs[0] : 0;
@@ -2950,19 +2950,19 @@ int xl1b_unload_drive(XL1BChanger *changer, int slot, int drive) {
     int rc = cmd_move_medium(&changer->internal, transport, drive_addr, slot_addr);
     element_map_free(&map);
 
-    return rc == 0 ? XL1B_OK : XL1B_ERR_SCSI;
+    return rc == 0 ? MCHANGER_OK : MCHANGER_ERR_SCSI;
 }
 
 /* Eject a disc to the import/export slot */
-int xl1b_eject(XL1BChanger *changer, int slot, int drive) {
-    if (!changer || slot < 1 || drive < 1) return XL1B_ERR_INVALID;
+int mchanger_eject(MChangerHandle *changer, int slot, int drive) {
+    if (!changer || slot < 1 || drive < 1) return MCHANGER_ERR_INVALID;
 
     ElementMap map = {0};
-    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+    if (fetch_element_map(&changer->internal, &map) != 0) return MCHANGER_ERR_SCSI;
 
     if ((size_t)slot > map.slots.count || (size_t)drive > map.drives.count || map.ie.count == 0) {
         element_map_free(&map);
-        return XL1B_ERR_INVALID;
+        return MCHANGER_ERR_INVALID;
     }
 
     uint16_t transport = map.transports.count > 0 ? map.transports.addrs[0] : 0;
@@ -2974,7 +2974,7 @@ int xl1b_eject(XL1BChanger *changer, int slot, int drive) {
     ElementStatus drive_st = {0}, slot_st = {0};
     if (read_element_status_info(&changer->internal, drive_addr, &drive_st, slot_addr, &slot_st) != 0) {
         element_map_free(&map);
-        return XL1B_ERR_SCSI;
+        return MCHANGER_ERR_SCSI;
     }
 
     int rc = 0;
@@ -2985,7 +2985,7 @@ int xl1b_eject(XL1BChanger *changer, int slot, int drive) {
         rc = cmd_move_medium(&changer->internal, transport, drive_addr, slot_addr);
         if (rc != 0) {
             element_map_free(&map);
-            return XL1B_ERR_SCSI;
+            return MCHANGER_ERR_SCSI;
         }
     }
 
@@ -2993,33 +2993,33 @@ int xl1b_eject(XL1BChanger *changer, int slot, int drive) {
     rc = cmd_move_medium(&changer->internal, transport, slot_addr, ie_addr);
     element_map_free(&map);
 
-    return rc == 0 ? XL1B_OK : XL1B_ERR_SCSI;
+    return rc == 0 ? MCHANGER_OK : MCHANGER_ERR_SCSI;
 }
 
 /* Low-level move medium */
-int xl1b_move_medium(XL1BChanger *changer, uint16_t transport, uint16_t source, uint16_t dest) {
-    if (!changer) return XL1B_ERR_INVALID;
-    return cmd_move_medium(&changer->internal, transport, source, dest) == 0 ? XL1B_OK : XL1B_ERR_SCSI;
+int mchanger_move_medium(MChangerHandle *changer, uint16_t transport, uint16_t source, uint16_t dest) {
+    if (!changer) return MCHANGER_ERR_INVALID;
+    return cmd_move_medium(&changer->internal, transport, source, dest) == 0 ? MCHANGER_OK : MCHANGER_ERR_SCSI;
 }
 
 /* Eject from macOS */
-int xl1b_eject_from_macos(void) {
+int mchanger_eject_from_macos(void) {
     return eject_optical_media();
 }
 
 /* Wait for mount */
-int xl1b_wait_for_mount(char *out_name, size_t name_len, char *out_size, size_t size_len, int timeout_secs) {
+int mchanger_wait_for_mount(char *out_name, size_t name_len, char *out_size, size_t size_len, int timeout_secs) {
     if (out_name && name_len > 0) out_name[0] = '\0';
     if (out_size && size_len > 0) out_size[0] = '\0';
 
     /* First check if already mounted */
     if (get_mounted_disc_info(out_name, name_len, out_size, size_len)) {
-        return XL1B_OK;
+        return MCHANGER_OK;
     }
 
     /* Set up DiskArbitration session */
     DASessionRef session = DASessionCreate(kCFAllocatorDefault);
-    if (!session) return XL1B_ERR_INVALID;
+    if (!session) return MCHANGER_ERR_INVALID;
 
     DACallbackContext ctx = {0};
     bool timed_out = false;
@@ -3043,23 +3043,23 @@ int xl1b_wait_for_mount(char *out_name, size_t name_len, char *out_size, size_t 
     if (ctx.found) {
         if (out_name && name_len > 0) strncpy(out_name, ctx.name, name_len - 1);
         if (out_size && size_len > 0) strncpy(out_size, ctx.size, size_len - 1);
-        return XL1B_OK;
+        return MCHANGER_OK;
     }
 
-    return timed_out ? XL1B_ERR_BUSY : XL1B_ERR_NOT_FOUND;
+    return timed_out ? MCHANGER_ERR_BUSY : MCHANGER_ERR_NOT_FOUND;
 }
 
 /* Device info */
-int xl1b_inquiry(XL1BChanger *changer, char *vendor, size_t vendor_len,
+int mchanger_inquiry(MChangerHandle *changer, char *vendor, size_t vendor_len,
                  char *product, size_t product_len, char *revision, size_t revision_len) {
-    if (!changer) return XL1B_ERR_INVALID;
+    if (!changer) return MCHANGER_ERR_INVALID;
 
     uint8_t cdb[6] = {0x12, 0, 0, 0, 96, 0}; /* INQUIRY */
     uint8_t buf[96] = {0};
 
     int rc = execute_cdb(&changer->internal, cdb, sizeof(cdb), buf, sizeof(buf),
                          kSCSIDataTransfer_FromTargetToInitiator, 10000);
-    if (rc != 0) return XL1B_ERR_SCSI;
+    if (rc != 0) return MCHANGER_ERR_SCSI;
 
     if (vendor && vendor_len > 0) {
         size_t len = vendor_len - 1 < 8 ? vendor_len - 1 : 8;
@@ -3083,10 +3083,10 @@ int xl1b_inquiry(XL1BChanger *changer, char *vendor, size_t vendor_len,
         while (len > 0 && revision[len - 1] == ' ') revision[--len] = '\0';
     }
 
-    return XL1B_OK;
+    return MCHANGER_OK;
 }
 
-int xl1b_test_unit_ready(XL1BChanger *changer) {
-    if (!changer) return XL1B_ERR_INVALID;
-    return cmd_test_unit_ready(&changer->internal) == 0 ? XL1B_OK : XL1B_ERR_SCSI;
+int mchanger_test_unit_ready(MChangerHandle *changer) {
+    if (!changer) return MCHANGER_ERR_INVALID;
+    return cmd_test_unit_ready(&changer->internal) == 0 ? MCHANGER_OK : MCHANGER_ERR_SCSI;
 }

@@ -1,5 +1,5 @@
 /*
- * test_xl1b_changer - Tests for xl1b_changer library
+ * test_mchanger - Tests for mchanger library
  *
  * Run with: make test
  *
@@ -7,7 +7,7 @@
  * Tests that require hardware will be skipped if no device is found.
  */
 
-#include "xl1b_changer.h"
+#include "mchanger.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +36,7 @@ static int tests_skipped = 0;
 #define ASSERT_NOT_NULL(p, msg) ASSERT((p) != NULL, msg)
 
 /* Global changer handle for tests that need hardware */
-static XL1BChanger *g_changer = NULL;
+static MChangerHandle *g_changer = NULL;
 static bool g_has_hardware = false;
 
 /*
@@ -46,11 +46,11 @@ static bool g_has_hardware = false;
  */
 
 TEST(list_changers_returns_valid) {
-    XL1BChangerInfo *list = NULL;
+    MChangerHandleInfo *list = NULL;
     size_t count = 999;
 
-    int rc = xl1b_list_changers(&list, &count);
-    ASSERT_EQ(rc, XL1B_OK, "xl1b_list_changers should return OK");
+    int rc = mchanger_list_changers(&list, &count);
+    ASSERT_EQ(rc, MCHANGER_OK, "mchanger_list_changers should return OK");
     /* count should be set to actual number (may be 0) */
     ASSERT(count != 999, "count should be modified");
 
@@ -61,55 +61,55 @@ TEST(list_changers_returns_valid) {
                "first entry should have vendor or product");
     }
 
-    xl1b_free_changer_list(list);
+    mchanger_free_changer_list(list);
     PASS();
 }
 
 TEST(list_changers_null_params) {
-    int rc = xl1b_list_changers(NULL, NULL);
-    ASSERT_EQ(rc, XL1B_ERR_INVALID, "should return INVALID for NULL params");
+    int rc = mchanger_list_changers(NULL, NULL);
+    ASSERT_EQ(rc, MCHANGER_ERR_INVALID, "should return INVALID for NULL params");
     PASS();
 }
 
 TEST(free_changer_list_null_safe) {
     /* Should not crash */
-    xl1b_free_changer_list(NULL);
+    mchanger_free_changer_list(NULL);
     PASS();
 }
 
 TEST(open_null_safe) {
     /* Opening with no device should return NULL or valid handle */
     /* This test just ensures it doesn't crash */
-    XL1BChanger *ch = xl1b_open(NULL);
+    MChangerHandle *ch = mchanger_open(NULL);
     if (ch) {
-        xl1b_close(ch);
+        mchanger_close(ch);
     }
     PASS();
 }
 
 TEST(close_null_safe) {
     /* Should not crash */
-    xl1b_close(NULL);
+    mchanger_close(NULL);
     PASS();
 }
 
 TEST(free_element_map_null_safe) {
-    xl1b_free_element_map(NULL);
+    mchanger_free_element_map(NULL);
     PASS();
 }
 
 TEST(api_null_changer_returns_invalid) {
-    XL1BElementMap map;
-    XL1BElementStatus status;
+    MChangerElementMap map;
+    MChangerElementStatus status;
 
-    ASSERT_EQ(xl1b_get_element_map(NULL, &map), XL1B_ERR_INVALID, "get_element_map");
-    ASSERT_EQ(xl1b_get_slot_status(NULL, 1, &status), XL1B_ERR_INVALID, "get_slot_status");
-    ASSERT_EQ(xl1b_get_drive_status(NULL, 1, &status), XL1B_ERR_INVALID, "get_drive_status");
-    ASSERT_EQ(xl1b_load_slot(NULL, 1, 1), XL1B_ERR_INVALID, "load_slot");
-    ASSERT_EQ(xl1b_unload_drive(NULL, 1, 1), XL1B_ERR_INVALID, "unload_drive");
-    ASSERT_EQ(xl1b_eject(NULL, 1, 1), XL1B_ERR_INVALID, "eject");
-    ASSERT_EQ(xl1b_move_medium(NULL, 0, 0, 0), XL1B_ERR_INVALID, "move_medium");
-    ASSERT_EQ(xl1b_test_unit_ready(NULL), XL1B_ERR_INVALID, "test_unit_ready");
+    ASSERT_EQ(mchanger_get_element_map(NULL, &map), MCHANGER_ERR_INVALID, "get_element_map");
+    ASSERT_EQ(mchanger_get_slot_status(NULL, 1, &status), MCHANGER_ERR_INVALID, "get_slot_status");
+    ASSERT_EQ(mchanger_get_drive_status(NULL, 1, &status), MCHANGER_ERR_INVALID, "get_drive_status");
+    ASSERT_EQ(mchanger_load_slot(NULL, 1, 1), MCHANGER_ERR_INVALID, "load_slot");
+    ASSERT_EQ(mchanger_unload_drive(NULL, 1, 1), MCHANGER_ERR_INVALID, "unload_drive");
+    ASSERT_EQ(mchanger_eject(NULL, 1, 1), MCHANGER_ERR_INVALID, "eject");
+    ASSERT_EQ(mchanger_move_medium(NULL, 0, 0, 0), MCHANGER_ERR_INVALID, "move_medium");
+    ASSERT_EQ(mchanger_test_unit_ready(NULL), MCHANGER_ERR_INVALID, "test_unit_ready");
 
     PASS();
 }
@@ -117,10 +117,10 @@ TEST(api_null_changer_returns_invalid) {
 TEST(api_invalid_slot_returns_invalid) {
     if (!g_has_hardware) SKIP("no hardware");
 
-    XL1BElementStatus status;
-    ASSERT_EQ(xl1b_get_slot_status(g_changer, 0, &status), XL1B_ERR_INVALID, "slot 0");
-    ASSERT_EQ(xl1b_get_slot_status(g_changer, -1, &status), XL1B_ERR_INVALID, "slot -1");
-    ASSERT_EQ(xl1b_load_slot(g_changer, 0, 1), XL1B_ERR_INVALID, "load slot 0");
+    MChangerElementStatus status;
+    ASSERT_EQ(mchanger_get_slot_status(g_changer, 0, &status), MCHANGER_ERR_INVALID, "slot 0");
+    ASSERT_EQ(mchanger_get_slot_status(g_changer, -1, &status), MCHANGER_ERR_INVALID, "slot -1");
+    ASSERT_EQ(mchanger_load_slot(g_changer, 0, 1), MCHANGER_ERR_INVALID, "load slot 0");
 
     PASS();
 }
@@ -142,8 +142,8 @@ TEST(open_and_close) {
 TEST(test_unit_ready) {
     if (!g_has_hardware) SKIP("no hardware");
 
-    int rc = xl1b_test_unit_ready(g_changer);
-    ASSERT_EQ(rc, XL1B_OK, "device should be ready");
+    int rc = mchanger_test_unit_ready(g_changer);
+    ASSERT_EQ(rc, MCHANGER_OK, "device should be ready");
     PASS();
 }
 
@@ -154,10 +154,10 @@ TEST(inquiry) {
     char product[64] = {0};
     char revision[16] = {0};
 
-    int rc = xl1b_inquiry(g_changer, vendor, sizeof(vendor),
+    int rc = mchanger_inquiry(g_changer, vendor, sizeof(vendor),
                           product, sizeof(product),
                           revision, sizeof(revision));
-    ASSERT_EQ(rc, XL1B_OK, "inquiry should succeed");
+    ASSERT_EQ(rc, MCHANGER_OK, "inquiry should succeed");
     ASSERT(strlen(vendor) > 0, "vendor should be set");
     ASSERT(strlen(product) > 0, "product should be set");
 
@@ -167,16 +167,16 @@ TEST(inquiry) {
 TEST(get_element_map) {
     if (!g_has_hardware) SKIP("no hardware");
 
-    XL1BElementMap map = {0};
-    int rc = xl1b_get_element_map(g_changer, &map);
-    ASSERT_EQ(rc, XL1B_OK, "should get element map");
+    MChangerElementMap map = {0};
+    int rc = mchanger_get_element_map(g_changer, &map);
+    ASSERT_EQ(rc, MCHANGER_OK, "should get element map");
     ASSERT(map.slot_count > 0, "should have slots");
     ASSERT(map.drive_count > 0, "should have drives");
     ASSERT(map.transport_count > 0, "should have transports");
     ASSERT_NOT_NULL(map.slot_addrs, "slot_addrs should be allocated");
     ASSERT_NOT_NULL(map.drive_addrs, "drive_addrs should be allocated");
 
-    xl1b_free_element_map(&map);
+    mchanger_free_element_map(&map);
 
     /* Verify map was cleared */
     ASSERT_NULL(map.slot_addrs, "slot_addrs should be NULL after free");
@@ -188,9 +188,9 @@ TEST(get_element_map) {
 TEST(get_slot_status) {
     if (!g_has_hardware) SKIP("no hardware");
 
-    XL1BElementStatus status = {0};
-    int rc = xl1b_get_slot_status(g_changer, 1, &status);
-    ASSERT_EQ(rc, XL1B_OK, "should get slot 1 status");
+    MChangerElementStatus status = {0};
+    int rc = mchanger_get_slot_status(g_changer, 1, &status);
+    ASSERT_EQ(rc, MCHANGER_OK, "should get slot 1 status");
     ASSERT(status.address != 0, "address should be set");
     /* full can be true or false, just check it's a valid response */
 
@@ -200,9 +200,9 @@ TEST(get_slot_status) {
 TEST(get_drive_status) {
     if (!g_has_hardware) SKIP("no hardware");
 
-    XL1BElementStatus status = {0};
-    int rc = xl1b_get_drive_status(g_changer, 1, &status);
-    ASSERT_EQ(rc, XL1B_OK, "should get drive 1 status");
+    MChangerElementStatus status = {0};
+    int rc = mchanger_get_drive_status(g_changer, 1, &status);
+    ASSERT_EQ(rc, MCHANGER_OK, "should get drive 1 status");
     ASSERT(status.address != 0, "address should be set");
 
     PASS();
@@ -212,18 +212,18 @@ TEST(load_same_slot_is_noop) {
     if (!g_has_hardware) SKIP("no hardware");
 
     /* Get current drive status */
-    XL1BElementStatus drive_st = {0};
-    int rc = xl1b_get_drive_status(g_changer, 1, &drive_st);
-    ASSERT_EQ(rc, XL1B_OK, "should get drive status");
+    MChangerElementStatus drive_st = {0};
+    int rc = mchanger_get_drive_status(g_changer, 1, &drive_st);
+    ASSERT_EQ(rc, MCHANGER_OK, "should get drive status");
 
     if (!drive_st.full || !drive_st.valid_source) {
         SKIP("drive empty or no source info");
     }
 
     /* Find which slot the disc came from */
-    XL1BElementMap map = {0};
-    rc = xl1b_get_element_map(g_changer, &map);
-    ASSERT_EQ(rc, XL1B_OK, "should get map");
+    MChangerElementMap map = {0};
+    rc = mchanger_get_element_map(g_changer, &map);
+    ASSERT_EQ(rc, MCHANGER_OK, "should get map");
 
     int source_slot = 0;
     for (size_t i = 0; i < map.slot_count; i++) {
@@ -232,15 +232,15 @@ TEST(load_same_slot_is_noop) {
             break;
         }
     }
-    xl1b_free_element_map(&map);
+    mchanger_free_element_map(&map);
 
     if (source_slot == 0) {
         SKIP("couldn't find source slot");
     }
 
     /* Loading the same slot should be a no-op */
-    rc = xl1b_load_slot(g_changer, source_slot, 1);
-    ASSERT_EQ(rc, XL1B_OK, "loading same slot should succeed (no-op)");
+    rc = mchanger_load_slot(g_changer, source_slot, 1);
+    ASSERT_EQ(rc, MCHANGER_OK, "loading same slot should succeed (no-op)");
 
     PASS();
 }
@@ -255,18 +255,18 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
-    printf("xl1b_changer library tests\n");
+    printf("mchanger library tests\n");
     printf("==========================\n\n");
 
     /* Check if hardware is available */
-    XL1BChangerInfo *list = NULL;
+    MChangerHandleInfo *list = NULL;
     size_t count = 0;
-    xl1b_list_changers(&list, &count);
+    mchanger_list_changers(&list, &count);
     g_has_hardware = (count > 0);
 
     if (g_has_hardware) {
         printf("Found %zu changer(s): %s %s\n", count, list[0].vendor, list[0].product);
-        g_changer = xl1b_open_ex(NULL, true, true); /* force, skip TUR for faster tests */
+        g_changer = mchanger_open_ex(NULL, true, true); /* force, skip TUR for faster tests */
         if (!g_changer) {
             printf("Warning: Could not open changer, hardware tests will be skipped\n");
             g_has_hardware = false;
@@ -274,7 +274,7 @@ int main(int argc, char **argv) {
     } else {
         printf("No changer hardware found, hardware tests will be skipped\n");
     }
-    xl1b_free_changer_list(list);
+    mchanger_free_changer_list(list);
 
     printf("\nRunning tests...\n\n");
 
@@ -301,7 +301,7 @@ int main(int argc, char **argv) {
 
     /* Cleanup */
     if (g_changer) {
-        xl1b_close(g_changer);
+        mchanger_close(g_changer);
     }
 
     /* Summary */

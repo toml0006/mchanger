@@ -1,6 +1,6 @@
 # Build outputs
-/xl1b_changer
-/test_xl1b_changer
+/mchanger
+/test_mchanger
 /vgp_changer/
 *.o
 *.a
