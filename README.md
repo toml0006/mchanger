@@ -1,6 +1,6 @@
 # mchanger
 
-A command-line tool to control SCSI media changer devices (jukeboxes/autoloaders) on macOS. Originally developed for the Sony VGP-XL1B 200-disc changer, because apparently someone still uses optical media in 2026.
+A command-line tool to control SCSI media changer devices (jukeboxes/autoloaders) on macOS. Originally developed for the [Sony VGP-XL1B](https://www.sony.com/electronics/support/home-video-media-changers/vgp-xl1b) 200-disc changer, a device released at the height of the [Windows Media Center](https://en.wikipedia.org/wiki/Windows_Media_Center) craze in the mid 2000s.
 
 Should work with other SCSI-compliant media changers, assuming you can find one.
 
@@ -23,7 +23,7 @@ Should work with other SCSI-compliant media changers, assuming you can find one.
   - FireWire (built-in port or Thunderbolt-to-FireWire adapter)
   - Other SCSI interfaces supported by macOS
 
-> **Important:** macOS 16 (Tahoe) [removed FireWire support entirely](https://tidbits.com/2025/09/19/support-for-firewire-removed-from-macos-26-tahoe/), because Apple's commitment to backwards compatibility remains as steadfast as ever. If your changer connects via FireWire, you must use macOS 15 (Sequoia) or earlier. Plan your OS upgrades accordingly, or don't—we're not your parents.
+> **Important:** macOS 16 (Tahoe) [removed FireWire support entirely](https://tidbits.com/2025/09/19/support-for-firewire-removed-from-macos-26-tahoe/). If your changer connects via FireWire, you must use macOS 15 (Sequoia) or earlier. Plan your OS upgrades accordingly, or don't!
 
 ## Build
 
@@ -89,7 +89,7 @@ cc -o myapp myapp.c -L. -lmchanger \
 ./mchanger load-slot --slot 1 --dry-run    # Show what would happen
 ```
 
-If a disc is already in the drive, it will automatically be unloaded to its original slot first. The robot arm does the work so you don't have to.
+If a disc is already in the drive, it will automatically be unloaded to its original slot first.
 
 ### Unload the drive
 
@@ -130,14 +130,14 @@ If the disc is currently in the drive, it will be unloaded first, then moved to 
 
 ## How It Works
 
-The tool communicates with the media changer using SCSI Media Changer (SMC) commands, a protocol from an era when "the cloud" meant actual weather:
+The tool communicates with the media changer using SCSI Media Changer (SMC) commands:
 
 - `READ ELEMENT STATUS` (0xB8) - Query status of slots, drives, and transport
 - `MOVE MEDIUM` (0xA5) - Move media between elements
 - `MODE SENSE` (0x1A) - Get element address assignments
 - Standard SCSI commands (INQUIRY, TEST UNIT READY, etc.)
 
-For FireWire devices, it uses the IOFireWireSBP2 interface to send SCSI commands over the Serial Bus Protocol. It's protocols all the way down.
+For FireWire devices, it uses the IOFireWireSBP2 interface to send SCSI commands over the Serial Bus Protocol.
 
 ## License
 
