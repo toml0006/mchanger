@@ -1,6 +1,19 @@
 # Build outputs
 /xl1b_changer
+/test_xl1b_changer
+/vgp_changer/
 *.o
+*.a
+
+# Debug output files
+*.txt
+
+# Separate projects
+/VGPChangerApp/
 
 # macOS
 .DS_Store
+
+# Xcode
+xcuserdata/
+*.xcworkspace

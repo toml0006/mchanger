@@ -1,3 +1,13 @@
+/*
+ * xl1b_changer - SCSI Media Changer Library and CLI
+ *
+ * A library/tool to control SCSI media changer devices on macOS.
+ *
+ * MIT License - Copyright (c) 2026 Jackson
+ */
+
+#include "xl1b_changer.h"
+
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOTypes.h>
@@ -5,9 +15,11 @@
 #include <IOKit/scsi/SCSITask.h>
 #include <IOKit/scsi/SCSICmds_REQUEST_SENSE_Defs.h>
 #include <IOKit/sbp2/IOFireWireSBP2Lib.h>
+#include <DiskArbitration/DiskArbitration.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define VENDOR_KEY CFSTR("Vendor Identification")
 #define PRODUCT_KEY CFSTR("Product Identification")
@@ -58,6 +70,9 @@ static int fetch_element_map(ChangerHandle *handle, ElementMap *map);
 static int cmd_mode_sense_element(ChangerHandle *handle);
 static int cmd_probe_storage(ChangerHandle *handle);
 static void parse_element_status(const uint8_t *buf, uint32_t len);
+static int cmd_inquiry_vpd(ChangerHandle *handle, uint8_t page);
+static int cmd_report_luns(ChangerHandle *handle);
+static int cmd_log_sense(ChangerHandle *handle, uint8_t page);
 
 static void print_usage(const char *argv0) {
     fprintf(stderr,
@@ -69,6 +84,9 @@ static void print_usage(const char *argv0) {
         "  %s scan-sbp2\n"
         "  %s test-unit-ready\n"
         "  %s inquiry\n"
+        "  %s inquiry-vpd --page <hex>\n"
+        "  %s report-luns\n"
+        "  %s log-sense --page <hex>\n"
         "  %s mode-sense-element\n"
         "  %s probe-storage\n"
         "  %s init-status\n"
@@ -77,8 +95,9 @@ static void print_usage(const char *argv0) {
         "  %s move --transport <addr> --source <addr> --dest <addr>\n"
         "  %s list-map\n"
         "  %s sanity-check\n"
-        "  %s load-slot --slot <n> --drive <n> [--transport <addr>]\n"
-        "  %s unload-drive --drive <n> --slot <n> [--transport <addr>]\n"
+        "  %s load-slot --slot <n> [--drive <n>] [--transport <addr>]\n"
+        "  %s unload-drive --slot <n> [--drive <n>] [--transport <addr>]\n"
+        "  %s eject --slot <n> [--drive <n>] [--transport <addr>]\n"
         "  %s load --transport <addr> --slot <addr> --drive <addr>\n"
         "  %s unload --transport <addr> --drive <addr> --slot <addr>\n"
         "\n"
@@ -89,12 +108,13 @@ static void print_usage(const char *argv0) {
         "- Use --dry-run to show resolved element addresses without moving media.\n"
         "- Use --confirm to require interactive confirmation before moving media.\n"
         "- Use --debug to print IORegistry details for troubleshooting.\n"
-        "- This is a stub: it sends SMC commands but does not fully parse responses.\n",
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0
+        "- Use --verbose or -v to show mounted disc info during load/unload.\n",
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0
     );
 }
 
 static bool g_debug = false;
+static bool g_verbose = false;
 
 static bool cfstring_equals(CFTypeRef value, const char *expected) {
     if (!value || CFGetTypeID(value) != CFStringGetTypeID()) {
@@ -157,29 +177,6 @@ static bool is_changer_device(io_service_t service) {
     }
     if (type) CFRelease(type);
     return is_type8;
-}
-
-static bool get_child_entry_id_with_property(io_registry_entry_t parent, CFStringRef key, uint64_t *entry_id_out) {
-    io_iterator_t iter = IO_OBJECT_NULL;
-    if (IORegistryEntryGetChildIterator(parent, kIOServicePlane, &iter) != KERN_SUCCESS) {
-        return false;
-    }
-    io_registry_entry_t child;
-    while ((child = IOIteratorNext(iter))) {
-        CFTypeRef value = IORegistryEntryCreateCFProperty(child, key, kCFAllocatorDefault, 0);
-        if (value) {
-            if (entry_id_out) {
-                IORegistryEntryGetRegistryEntryID(child, entry_id_out);
-            }
-            CFRelease(value);
-            IOObjectRelease(child);
-            IOObjectRelease(iter);
-            return true;
-        }
-        IOObjectRelease(child);
-    }
-    IOObjectRelease(iter);
-    return false;
 }
 
 static io_service_t find_scsi_task_device(io_service_t changer_nub) {
@@ -1155,6 +1152,65 @@ static int cmd_inquiry(ChangerHandle *handle) {
     return rc;
 }
 
+static int cmd_inquiry_vpd(ChangerHandle *handle, uint8_t page) {
+    uint8_t cdb[6] = {0};
+    cdb[0] = 0x12; // INQUIRY
+    cdb[1] = 0x01; // EVPD
+    cdb[2] = page;
+    uint16_t alloc = 512;
+    cdb[4] = (uint8_t)alloc;
+
+    uint8_t buf[512];
+    memset(buf, 0, sizeof(buf));
+    int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 10000);
+    if (rc == 0) {
+        uint16_t page_len = (buf[2] << 8) | buf[3];
+        printf("INQUIRY VPD page 0x%02x length=%u\n", page, page_len);
+        dump_hex(buf, (page_len + 4 <= alloc) ? page_len + 4 : alloc);
+    }
+    return rc;
+}
+
+static int cmd_report_luns(ChangerHandle *handle) {
+    uint8_t cdb[12] = {0};
+    cdb[0] = 0xA0; // REPORT LUNS
+    uint32_t alloc = 512;
+    cdb[6] = (alloc >> 24) & 0xFF;
+    cdb[7] = (alloc >> 16) & 0xFF;
+    cdb[8] = (alloc >> 8) & 0xFF;
+    cdb[9] = alloc & 0xFF;
+
+    uint8_t buf[512];
+    memset(buf, 0, sizeof(buf));
+    int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 10000);
+    if (rc == 0) {
+        uint32_t list_len = (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
+        printf("REPORT LUNS length=%u\n", list_len);
+        dump_hex(buf, (list_len + 8 <= alloc) ? list_len + 8 : alloc);
+    }
+    return rc;
+}
+
+static int cmd_log_sense(ChangerHandle *handle, uint8_t page) {
+    uint8_t cdb[10] = {0};
+    cdb[0] = 0x4D; // LOG SENSE(10)
+    cdb[1] = 0x00;
+    cdb[2] = page & 0x3F;
+    uint16_t alloc = 512;
+    cdb[7] = (alloc >> 8) & 0xFF;
+    cdb[8] = alloc & 0xFF;
+
+    uint8_t buf[512];
+    memset(buf, 0, sizeof(buf));
+    int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 10000);
+    if (rc == 0) {
+        uint16_t page_len = (buf[2] << 8) | buf[3];
+        printf("LOG SENSE page 0x%02x length=%u\n", page, page_len);
+        dump_hex(buf, (page_len + 4 <= alloc) ? page_len + 4 : alloc);
+    }
+    return rc;
+}
+
 static int read_mode_sense_element(ChangerHandle *handle, ElementAddrAssignment *out, bool print) {
     uint8_t cdb[10] = {0};
     cdb[0] = 0x5A; // MODE SENSE(10)
@@ -1306,7 +1362,7 @@ static const char *element_type_name(uint8_t type) {
 
 static void print_flags(uint8_t flags) {
     bool except = (flags & 0x80) != 0;
-    bool full = (flags & 0x20) != 0;
+    bool full = (flags & 0x01) != 0;
     printf(" except=%s full=%s flags=0x%02x", except ? "1" : "0", full ? "1" : "0", flags);
 }
 
@@ -1490,6 +1546,344 @@ static int cmd_read_element_status(ChangerHandle *handle, uint8_t element_type, 
     return rc;
 }
 
+// Eject any mounted optical media before unloading from drive.
+// Returns 0 on success (or no optical media found), non-zero on failure.
+static int eject_optical_media(void) {
+    // Use popen to run diskutil and find optical drives
+    FILE *fp = popen("diskutil list external 2>/dev/null", "r");
+    if (!fp) {
+        fprintf(stderr, "Warning: Could not run diskutil to check for optical media.\n");
+        return 0; // Continue anyway
+    }
+
+    char line[512];
+    char disk_to_eject[64] = {0};
+
+    while (fgets(line, sizeof(line), fp)) {
+        // Look for lines like "/dev/disk4 (external, physical):"
+        if (strncmp(line, "/dev/disk", 9) == 0) {
+            // Extract disk identifier (e.g., "disk4")
+            char *start = line + 5; // Skip "/dev/"
+            char *end = strchr(start, ' ');
+            if (end && (end - start) < (int)sizeof(disk_to_eject)) {
+                strncpy(disk_to_eject, start, end - start);
+                disk_to_eject[end - start] = '\0';
+            }
+        }
+        // Check if this is an optical disc (CD/DVD partition scheme)
+        if (strstr(line, "CD_partition_scheme") || strstr(line, "DVD_partition_scheme") ||
+            strstr(line, "CD_DA") || strstr(line, "BD_partition_scheme")) {
+            if (disk_to_eject[0] != '\0') {
+                break; // Found an optical disc
+            }
+        }
+    }
+    pclose(fp);
+
+    if (disk_to_eject[0] == '\0') {
+        // No optical media found, nothing to eject
+        return 0;
+    }
+
+    printf("Ejecting optical media (%s) before unload...\n", disk_to_eject);
+
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "diskutil eject %s 2>&1", disk_to_eject);
+    int ret = system(cmd);
+    if (ret != 0) {
+        fprintf(stderr, "Warning: diskutil eject returned %d\n", ret);
+        // Continue anyway - the physical move might still work
+    }
+
+    // Give the system a moment to process the eject
+    usleep(500000); // 500ms
+
+    return 0;
+}
+
+// Get info about mounted optical disc. Returns disc name in out_name (caller provides buffer).
+// Returns true if an optical disc is found, false otherwise.
+static bool get_mounted_disc_info(char *out_name, size_t name_len, char *out_size, size_t size_len) {
+    if (out_name && name_len > 0) out_name[0] = '\0';
+    if (out_size && size_len > 0) out_size[0] = '\0';
+
+    FILE *fp = popen("diskutil list external 2>/dev/null", "r");
+    if (!fp) return false;
+
+    char line[512];
+    bool found_optical = false;
+    bool in_optical_disk = false;
+
+    while (fgets(line, sizeof(line), fp)) {
+        // Look for external disk header
+        if (strncmp(line, "/dev/disk", 9) == 0) {
+            in_optical_disk = false;
+        }
+        // Check if this is an optical disc
+        if (strstr(line, "CD_partition_scheme") || strstr(line, "DVD_partition_scheme") ||
+            strstr(line, "BD_partition_scheme")) {
+            in_optical_disk = true;
+            found_optical = true;
+            // Parse line like "   0:        CD_partition_scheme You By Me: Vol. 1      *385.6 MB   disk4"
+            // Find the disc name - it's between the scheme type and the size (*xxx MB/GB)
+            char *scheme_end = strstr(line, "_scheme");
+            if (scheme_end) {
+                scheme_end += 7; // skip "_scheme"
+                while (*scheme_end == ' ') scheme_end++;
+                // Find the size marker (starts with *)
+                char *size_start = strstr(scheme_end, "*");
+                if (size_start && out_name && name_len > 0) {
+                    // Name is between scheme_end and size_start
+                    char *name_end = size_start;
+                    while (name_end > scheme_end && *(name_end-1) == ' ') name_end--;
+                    size_t copy_len = name_end - scheme_end;
+                    if (copy_len >= name_len) copy_len = name_len - 1;
+                    strncpy(out_name, scheme_end, copy_len);
+                    out_name[copy_len] = '\0';
+                }
+                // Get size
+                if (size_start && out_size && size_len > 0) {
+                    size_start++; // skip *
+                    char *size_end = size_start;
+                    while (*size_end && *size_end != ' ' && *size_end != '\t') size_end++;
+                    // Include unit (MB/GB)
+                    while (*size_end == ' ') size_end++;
+                    while (*size_end && *size_end != ' ' && *size_end != '\t') size_end++;
+                    size_t copy_len = size_end - size_start;
+                    if (copy_len >= size_len) copy_len = size_len - 1;
+                    strncpy(out_size, size_start, copy_len);
+                    out_size[copy_len] = '\0';
+                }
+            }
+            break;
+        }
+    }
+    pclose(fp);
+    return found_optical;
+}
+
+// DiskArbitration callback context
+typedef struct {
+    bool found;
+    char name[256];
+    char size[64];
+} DACallbackContext;
+
+// Callback for disk appeared event
+static void disk_appeared_callback(DADiskRef disk, void *context) {
+    DACallbackContext *ctx = (DACallbackContext *)context;
+    if (ctx->found) return; // Already found one
+
+    CFDictionaryRef desc = DADiskCopyDescription(disk);
+    if (!desc) return;
+
+    // Check if this is an optical disc (CD/DVD/BD)
+    CFStringRef mediaType = CFDictionaryGetValue(desc, kDADiskDescriptionMediaTypeKey);
+    CFStringRef mediaKind = CFDictionaryGetValue(desc, kDADiskDescriptionMediaKindKey);
+
+    bool is_optical = false;
+    if (mediaKind) {
+        char kind[128] = {0};
+        CFStringGetCString(mediaKind, kind, sizeof(kind), kCFStringEncodingUTF8);
+        if (strstr(kind, "CD") || strstr(kind, "DVD") || strstr(kind, "BD")) {
+            is_optical = true;
+        }
+    }
+    if (mediaType) {
+        char type[128] = {0};
+        CFStringGetCString(mediaType, type, sizeof(type), kCFStringEncodingUTF8);
+        if (strstr(type, "CD") || strstr(type, "DVD") || strstr(type, "BD")) {
+            is_optical = true;
+        }
+    }
+
+    if (is_optical) {
+        ctx->found = true;
+
+        // Get volume name
+        CFStringRef volName = CFDictionaryGetValue(desc, kDADiskDescriptionVolumeNameKey);
+        if (volName) {
+            CFStringGetCString(volName, ctx->name, sizeof(ctx->name), kCFStringEncodingUTF8);
+        } else {
+            // Try media name
+            CFStringRef mediaName = CFDictionaryGetValue(desc, kDADiskDescriptionMediaNameKey);
+            if (mediaName) {
+                CFStringGetCString(mediaName, ctx->name, sizeof(ctx->name), kCFStringEncodingUTF8);
+            }
+        }
+
+        // Get size
+        CFNumberRef sizeNum = CFDictionaryGetValue(desc, kDADiskDescriptionMediaSizeKey);
+        if (sizeNum) {
+            long long size = 0;
+            CFNumberGetValue(sizeNum, kCFNumberLongLongType, &size);
+            if (size >= 1000000000) {
+                snprintf(ctx->size, sizeof(ctx->size), "%.1f GB", size / 1000000000.0);
+            } else {
+                snprintf(ctx->size, sizeof(ctx->size), "%.1f MB", size / 1000000.0);
+            }
+        }
+
+        CFRunLoopStop(CFRunLoopGetCurrent());
+    }
+
+    CFRelease(desc);
+}
+
+// Timer callback for timeout
+static void timeout_callback(CFRunLoopTimerRef timer __attribute__((unused)), void *info) {
+    bool *timed_out = (bool *)info;
+    *timed_out = true;
+    CFRunLoopStop(CFRunLoopGetCurrent());
+}
+
+// Wait for disc to be mounted using DiskArbitration and print info
+static void wait_and_print_mounted_disc(void) {
+    // First check if already mounted
+    char name[256] = {0};
+    char size[64] = {0};
+    if (get_mounted_disc_info(name, sizeof(name), size, sizeof(size))) {
+        printf("  Mounted: %s (%s)\n", name[0] ? name : "Unknown", size[0] ? size : "?");
+        return;
+    }
+
+    // Set up DiskArbitration session
+    DASessionRef session = DASessionCreate(kCFAllocatorDefault);
+    if (!session) {
+        printf("  Mounted: (unable to create DA session)\n");
+        return;
+    }
+
+    DACallbackContext ctx = {0};
+    bool timed_out = false;
+
+    // Register for disk appeared events
+    DARegisterDiskAppearedCallback(session, NULL, disk_appeared_callback, &ctx);
+    DASessionScheduleWithRunLoop(session, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+
+    // Set up timeout (30 seconds)
+    CFRunLoopTimerContext timerCtx = { 0, &timed_out, NULL, NULL, NULL };
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault,
+        CFAbsoluteTimeGetCurrent() + 30.0, 0, 0, 0, timeout_callback, &timerCtx);
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+
+    // Run until disc appears or timeout
+    CFRunLoopRun();
+
+    // Cleanup
+    CFRunLoopRemoveTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+    CFRelease(timer);
+    DAUnregisterCallback(session, disk_appeared_callback, &ctx);
+    DASessionUnscheduleFromRunLoop(session, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+    CFRelease(session);
+
+    if (ctx.found) {
+        printf("  Mounted: %s (%s)\n", ctx.name[0] ? ctx.name : "Audio CD", ctx.size[0] ? ctx.size : "?");
+    } else if (timed_out) {
+        printf("  Mounted: (timed out waiting for disc)\n");
+    } else {
+        printf("  Mounted: (unknown)\n");
+    }
+}
+
+// Structure to hold element status info
+typedef struct {
+    uint16_t addr;
+    bool full;
+    bool valid_src;
+    uint16_t src_addr;
+} ElementStatus;
+
+// Read element status and find info for specific elements
+// Returns 0 on success, fills in drive_status and slot_status if non-NULL
+static int read_element_status_info(ChangerHandle *handle, uint16_t drive_addr, ElementStatus *drive_status,
+                                    uint16_t slot_addr, ElementStatus *slot_status) {
+    uint32_t alloc = 4096;
+    uint8_t cdb[12] = {0};
+    cdb[0] = 0xB8; // READ ELEMENT STATUS
+    cdb[1] = 0x00; // all element types
+    cdb[4] = 0xFF;
+    cdb[5] = 0xFF;
+    cdb[6] = (alloc >> 16) & 0xFF;
+    cdb[7] = (alloc >> 8) & 0xFF;
+    cdb[8] = alloc & 0xFF;
+
+    uint8_t *buf = calloc(1, alloc);
+    if (!buf) return -1;
+
+    int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 30000);
+    if (rc != 0) {
+        free(buf);
+        return rc;
+    }
+
+    // Initialize output
+    if (drive_status) {
+        drive_status->addr = drive_addr;
+        drive_status->full = false;
+        drive_status->valid_src = false;
+        drive_status->src_addr = 0;
+    }
+    if (slot_status) {
+        slot_status->addr = slot_addr;
+        slot_status->full = false;
+        slot_status->valid_src = false;
+        slot_status->src_addr = 0;
+    }
+
+    // Parse element status pages
+    uint32_t len = alloc;
+    if (len < 8) {
+        free(buf);
+        return 0;
+    }
+
+    uint32_t offset = 8;
+    while (offset + 8 <= len) {
+        uint16_t desc_len = (buf[offset + 2] << 8) | buf[offset + 3];
+        uint32_t page_bytes = (buf[offset + 5] << 16) | (buf[offset + 6] << 8) | buf[offset + 7];
+        offset += 8;
+
+        if (desc_len == 0 || page_bytes == 0) break;
+
+        uint32_t page_end = offset + page_bytes;
+        if (page_end > len) page_end = len;
+
+        while (offset + desc_len <= page_end) {
+            uint16_t elem_addr = (buf[offset] << 8) | buf[offset + 1];
+            uint8_t elem_flags = buf[offset + 2];
+            bool full = (elem_flags & 0x01) != 0;
+
+            bool svalid = false;
+            uint16_t src = 0;
+            if (desc_len >= 12) {
+                svalid = (buf[offset + 9] & 0x80) != 0;
+                src = (buf[offset + 10] << 8) | buf[offset + 11];
+            }
+
+            if (drive_status && elem_addr == drive_addr) {
+                drive_status->full = full;
+                drive_status->valid_src = svalid;
+                drive_status->src_addr = src;
+            }
+            if (slot_status && elem_addr == slot_addr) {
+                slot_status->full = full;
+                slot_status->valid_src = svalid;
+                slot_status->src_addr = src;
+            }
+
+            offset += desc_len;
+        }
+
+        if (offset < page_end) {
+            offset = page_end;
+        }
+    }
+
+    free(buf);
+    return 0;
+}
+
 static int cmd_move_medium(ChangerHandle *handle, uint16_t transport, uint16_t source, uint16_t dest) {
     uint8_t cdb[12] = {0};
     cdb[0] = 0xA5; // MOVE MEDIUM
@@ -1601,6 +1995,15 @@ static bool parse_u32(const char *s, uint32_t *out) {
     return true;
 }
 
+static bool parse_u8(const char *s, uint8_t *out) {
+    if (!s || !out) return false;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 0);
+    if (!end || *end != '\0' || v > 0xFF) return false;
+    *out = (uint8_t)v;
+    return true;
+}
+
 static bool parse_element_type(const char *s, uint8_t *out) {
     if (!s || !out) return false;
     if (strcmp(s, "all") == 0) { *out = 0x00; return true; }
@@ -1629,6 +2032,14 @@ static bool confirm_move(void) {
     return (strncmp(buf, "yes", 3) == 0);
 }
 
+/*
+ * =============================================================================
+ * CLI Main (excluded when building as library with -DXL1B_NO_MAIN)
+ * =============================================================================
+ */
+
+#ifndef XL1B_NO_MAIN
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -1645,6 +2056,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
         if (strcmp(argv[i], "--confirm") == 0) confirm = true;
         if (strcmp(argv[i], "--debug") == 0) g_debug = true;
+        if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) g_verbose = true;
     }
 
     if (strcmp(argv[1], "list") == 0) {
@@ -1699,6 +2111,34 @@ int main(int argc, char **argv) {
         rc = cmd_test_unit_ready(&handle);
     } else if (strcmp(argv[1], "inquiry") == 0) {
         rc = cmd_inquiry(&handle);
+    } else if (strcmp(argv[1], "inquiry-vpd") == 0) {
+        uint8_t page = 0;
+        bool have_page = false;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--page") == 0 && i + 1 < argc) {
+                have_page = parse_u8(argv[++i], &page);
+            }
+        }
+        if (!have_page) {
+            fprintf(stderr, "Missing or invalid --page.\n");
+            rc = 1; goto out;
+        }
+        rc = cmd_inquiry_vpd(&handle, page);
+    } else if (strcmp(argv[1], "report-luns") == 0) {
+        rc = cmd_report_luns(&handle);
+    } else if (strcmp(argv[1], "log-sense") == 0) {
+        uint8_t page = 0;
+        bool have_page = false;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--page") == 0 && i + 1 < argc) {
+                have_page = parse_u8(argv[++i], &page);
+            }
+        }
+        if (!have_page) {
+            fprintf(stderr, "Missing or invalid --page.\n");
+            rc = 1; goto out;
+        }
+        rc = cmd_log_sense(&handle, page);
     } else if (strcmp(argv[1], "mode-sense-element") == 0) {
         rc = cmd_mode_sense_element(&handle);
     } else if (strcmp(argv[1], "probe-storage") == 0) {
@@ -1778,21 +2218,21 @@ int main(int argc, char **argv) {
         }
         element_map_free(&map);
     } else if (strcmp(argv[1], "load-slot") == 0) {
-        size_t slot_index = 0, drive_index = 0;
-        bool have_slot = false, have_drive = false;
+        size_t slot_index = 0, drive_index = 1; // default to drive 1
+        bool have_slot = false;
         bool have_transport = false;
         uint16_t transport = 0;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--slot") == 0 && i + 1 < argc) {
                 have_slot = parse_index(argv[++i], &slot_index);
             } else if (strcmp(argv[i], "--drive") == 0 && i + 1 < argc) {
-                have_drive = parse_index(argv[++i], &drive_index);
+                parse_index(argv[++i], &drive_index);
             } else if (strcmp(argv[i], "--transport") == 0 && i + 1 < argc) {
                 have_transport = parse_u16(argv[++i], &transport);
             }
         }
-        if (!have_slot || !have_drive) {
-            fprintf(stderr, "Missing --slot or --drive.\n");
+        if (!have_slot) {
+            fprintf(stderr, "Missing --slot.\n");
             rc = 1; goto out;
         }
         ElementMap map = {0};
@@ -1821,36 +2261,133 @@ int main(int argc, char **argv) {
         }
         uint16_t slot_addr = map.slots.addrs[slot_index - 1];
         uint16_t drive_addr = map.drives.addrs[drive_index - 1];
+
+        // Check if drive already has a disc - if so, unload it first
+        ElementStatus drive_st = {0}, target_slot_st = {0};
+        rc = read_element_status_info(&handle, drive_addr, &drive_st, slot_addr, &target_slot_st);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to read element status.\n");
+            element_map_free(&map);
+            goto out;
+        }
+
+        // Check if the target slot's disc is already in the drive
+        if (target_slot_st.full) {
+            // Slot has disc, we can load it
+        } else if (drive_st.full && drive_st.valid_src && drive_st.src_addr == slot_addr) {
+            // The disc we want is already in the drive
+            printf("LOAD: Disc from slot %u is already in drive %u.\n",
+                   (unsigned)slot_index, (unsigned)drive_index);
+            element_map_free(&map);
+            goto out;
+        } else if (!target_slot_st.full) {
+            fprintf(stderr, "Slot %u is empty.\n", (unsigned)slot_index);
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+
         printf("LOAD: transport=0x%04x slot=%u(0x%04x) drive=%u(0x%04x)\n",
                transport, (unsigned)slot_index, slot_addr,
                (unsigned)drive_index, drive_addr);
-        if (dry_run) {
-            printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x\n",
-                   transport, slot_addr, drive_addr);
-        } else {
-            if (confirm && !confirm_move()) {
-                fprintf(stderr, "Aborted.\n");
-                rc = 1; goto out;
+
+        // Show current mounted disc in verbose mode
+        if (g_verbose && drive_st.full) {
+            char name[256] = {0};
+            char size[64] = {0};
+            if (get_mounted_disc_info(name, sizeof(name), size, sizeof(size))) {
+                printf("  Currently mounted: %s (%s)\n", name[0] ? name : "Unknown", size[0] ? size : "?");
             }
-            rc = cmd_move_medium(&handle, transport, slot_addr, drive_addr);
+        }
+
+        // If drive has a different disc, unload it first
+        if (drive_st.full) {
+            uint16_t unload_slot_addr = 0;
+            size_t unload_slot_index = 0;
+
+            if (drive_st.valid_src) {
+                unload_slot_addr = drive_st.src_addr;
+                // Find the slot index for this address
+                for (size_t i = 0; i < map.slots.count; i++) {
+                    if (map.slots.addrs[i] == unload_slot_addr) {
+                        unload_slot_index = i + 1;
+                        break;
+                    }
+                }
+            }
+
+            if (unload_slot_addr == 0 || unload_slot_index == 0) {
+                fprintf(stderr, "Drive has a disc but cannot determine source slot.\n");
+                rc = 1;
+                element_map_free(&map);
+                goto out;
+            }
+
+            printf("  Drive has disc from slot %zu(0x%04x), unloading first...\n",
+                   unload_slot_index, unload_slot_addr);
+
+            if (dry_run) {
+                printf("DRY RUN: Eject from macOS\n");
+                printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x (unload)\n",
+                       transport, drive_addr, unload_slot_addr);
+                printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x (load)\n",
+                       transport, slot_addr, drive_addr);
+            } else {
+                if (confirm && !confirm_move()) {
+                    fprintf(stderr, "Aborted.\n");
+                    rc = 1;
+                    element_map_free(&map);
+                    goto out;
+                }
+                // Eject from macOS
+                eject_optical_media();
+                // Unload current disc
+                rc = cmd_move_medium(&handle, transport, drive_addr, unload_slot_addr);
+                if (rc != 0) {
+                    fprintf(stderr, "Failed to unload current disc.\n");
+                    element_map_free(&map);
+                    goto out;
+                }
+                // Load requested disc
+                printf("  Loading slot %u...\n", (unsigned)slot_index);
+                rc = cmd_move_medium(&handle, transport, slot_addr, drive_addr);
+            }
+        } else {
+            // Drive is empty, just load
+            if (dry_run) {
+                printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x\n",
+                       transport, slot_addr, drive_addr);
+            } else {
+                if (confirm && !confirm_move()) {
+                    fprintf(stderr, "Aborted.\n");
+                    rc = 1;
+                    element_map_free(&map);
+                    goto out;
+                }
+                rc = cmd_move_medium(&handle, transport, slot_addr, drive_addr);
+            }
+        }
+        // Show newly mounted disc in verbose mode
+        if (g_verbose && rc == 0 && !dry_run) {
+            wait_and_print_mounted_disc();
         }
         element_map_free(&map);
     } else if (strcmp(argv[1], "unload-drive") == 0) {
-        size_t slot_index = 0, drive_index = 0;
-        bool have_slot = false, have_drive = false;
+        size_t slot_index = 0, drive_index = 1; // default to drive 1
+        bool have_slot = false;
         bool have_transport = false;
         uint16_t transport = 0;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--slot") == 0 && i + 1 < argc) {
                 have_slot = parse_index(argv[++i], &slot_index);
             } else if (strcmp(argv[i], "--drive") == 0 && i + 1 < argc) {
-                have_drive = parse_index(argv[++i], &drive_index);
+                parse_index(argv[++i], &drive_index);
             } else if (strcmp(argv[i], "--transport") == 0 && i + 1 < argc) {
                 have_transport = parse_u16(argv[++i], &transport);
             }
         }
-        if (!have_slot || !have_drive) {
-            fprintf(stderr, "Missing --slot or --drive.\n");
+        if (!have_slot) {
+            fprintf(stderr, "Missing --slot.\n");
             rc = 1; goto out;
         }
         ElementMap map = {0};
@@ -1890,7 +2427,154 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Aborted.\n");
                 rc = 1; goto out;
             }
+            // Eject optical media from macOS before physical unload
+            eject_optical_media();
             rc = cmd_move_medium(&handle, transport, drive_addr, slot_addr);
+        }
+        element_map_free(&map);
+    } else if (strcmp(argv[1], "eject") == 0) {
+        // Eject a disc from the machine via the I/E slot
+        // If the disc is currently in the drive, unload it first
+        size_t slot_index = 0, drive_index = 1; // default drive 1
+        bool have_slot = false, have_drive = false;
+        bool have_transport = false;
+        uint16_t transport = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--slot") == 0 && i + 1 < argc) {
+                have_slot = parse_index(argv[++i], &slot_index);
+            } else if (strcmp(argv[i], "--drive") == 0 && i + 1 < argc) {
+                have_drive = parse_index(argv[++i], &drive_index);
+            } else if (strcmp(argv[i], "--transport") == 0 && i + 1 < argc) {
+                have_transport = parse_u16(argv[++i], &transport);
+            }
+        }
+        if (!have_slot) {
+            fprintf(stderr, "Missing --slot.\n");
+            rc = 1; goto out;
+        }
+        ElementMap map = {0};
+        rc = fetch_element_map(&handle, &map);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to read element map.\n");
+            element_map_free(&map);
+            goto out;
+        }
+        if (slot_index == 0 || slot_index > map.slots.count) {
+            fprintf(stderr, "Slot out of range. Slots: %zu\n", map.slots.count);
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+        if (!have_drive) drive_index = 1;
+        if (drive_index == 0 || drive_index > map.drives.count) {
+            fprintf(stderr, "Drive out of range. Drives: %zu\n", map.drives.count);
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+        if (map.ie.count == 0) {
+            fprintf(stderr, "No import/export element found.\n");
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+        if (!have_transport) {
+            if (map.transports.count == 0) {
+                fprintf(stderr, "No transport element found.\n");
+                rc = 1;
+                element_map_free(&map);
+                goto out;
+            }
+            transport = map.transports.addrs[0];
+        }
+        uint16_t slot_addr = map.slots.addrs[slot_index - 1];
+        uint16_t drive_addr = map.drives.addrs[drive_index - 1];
+        uint16_t ie_addr = map.ie.addrs[0];
+
+        // Check element status to see if disc is in slot or in drive
+        ElementStatus drive_st = {0}, slot_st = {0};
+        rc = read_element_status_info(&handle, drive_addr, &drive_st, slot_addr, &slot_st);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to read element status.\n");
+            element_map_free(&map);
+            goto out;
+        }
+
+        bool disc_in_drive = false;
+        if (!slot_st.full && drive_st.full) {
+            // Slot is empty and drive has a disc - check if it came from this slot
+            if (drive_st.valid_src && drive_st.src_addr == slot_addr) {
+                disc_in_drive = true;
+            } else if (!drive_st.valid_src) {
+                // No source info, assume disc in drive belongs to this slot if slot is empty
+                disc_in_drive = true;
+            }
+        }
+
+        if (!slot_st.full && !disc_in_drive) {
+            fprintf(stderr, "Slot %zu is empty and disc is not in drive.\n", slot_index);
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+
+        printf("EJECT: slot=%zu(0x%04x) via ie(0x%04x)\n", slot_index, slot_addr, ie_addr);
+
+        if (disc_in_drive) {
+            printf("  Disc is currently in drive %zu(0x%04x), unloading first...\n",
+                   drive_index, drive_addr);
+            if (dry_run) {
+                printf("DRY RUN: Eject from macOS\n");
+                printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x (unload to slot)\n",
+                       transport, drive_addr, slot_addr);
+                printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x (eject to I/E)\n",
+                       transport, slot_addr, ie_addr);
+            } else {
+                if (confirm && !confirm_move()) {
+                    fprintf(stderr, "Aborted.\n");
+                    rc = 1;
+                    element_map_free(&map);
+                    goto out;
+                }
+                // Step 1: Eject from macOS
+                eject_optical_media();
+                // Step 2: Unload from drive to slot
+                printf("  Moving from drive to slot...\n");
+                rc = cmd_move_medium(&handle, transport, drive_addr, slot_addr);
+                if (rc != 0) {
+                    fprintf(stderr, "Failed to unload from drive.\n");
+                    element_map_free(&map);
+                    goto out;
+                }
+                // Step 3: Move from slot to I/E
+                printf("  Moving from slot to I/E...\n");
+                rc = cmd_move_medium(&handle, transport, slot_addr, ie_addr);
+                if (rc != 0) {
+                    fprintf(stderr, "Failed to move to I/E slot.\n");
+                }
+            }
+        } else {
+            // Disc is in slot, just move to I/E
+            if (dry_run) {
+                printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x (eject to I/E)\n",
+                       transport, slot_addr, ie_addr);
+            } else {
+                if (confirm && !confirm_move()) {
+                    fprintf(stderr, "Aborted.\n");
+                    rc = 1;
+                    element_map_free(&map);
+                    goto out;
+                }
+                printf("  Moving from slot to I/E...\n");
+                rc = cmd_move_medium(&handle, transport, slot_addr, ie_addr);
+                if (rc != 0) {
+                    fprintf(stderr, "Failed to move to I/E slot.\n");
+                }
+            }
+        }
+
+        if (rc == 0) {
+            printf("Disc ejected to I/E slot. You can now remove it from the changer.\n");
         }
         element_map_free(&map);
     } else if (strcmp(argv[1], "load") == 0) {
@@ -1943,6 +2627,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Aborted.\n");
                 rc = 1; goto out;
             }
+            // Eject optical media from macOS before physical unload
+            eject_optical_media();
             rc = cmd_move_medium(&handle, transport, drive, slot);
         }
     } else {
@@ -1953,4 +2639,454 @@ int main(int argc, char **argv) {
 out:
     close_changer(&handle);
     return rc;
+}
+
+#endif /* XL1B_NO_MAIN */
+
+/*
+ * =============================================================================
+ * Public API Implementation
+ * =============================================================================
+ */
+
+/* Internal handle is compatible with public handle */
+struct XL1BChanger {
+    ChangerHandle internal;
+};
+
+/* List available changer devices */
+int xl1b_list_changers(XL1BChangerInfo **out_list, size_t *out_count) {
+    if (!out_list || !out_count) return XL1B_ERR_INVALID;
+
+    *out_list = NULL;
+    *out_count = 0;
+
+    io_iterator_t iter = match_scsi_devices();
+    if (iter == IO_OBJECT_NULL) return XL1B_ERR_NOT_FOUND;
+
+    /* Count changers first */
+    size_t count = 0;
+    io_service_t service;
+    while ((service = IOIteratorNext(iter))) {
+        if (is_changer_device(service)) count++;
+        IOObjectRelease(service);
+    }
+
+    if (count == 0) {
+        IOObjectRelease(iter);
+        return XL1B_OK; /* No changers found, but not an error */
+    }
+
+    /* Allocate and fill */
+    XL1BChangerInfo *list = calloc(count, sizeof(XL1BChangerInfo));
+    if (!list) {
+        IOObjectRelease(iter);
+        return XL1B_ERR_INVALID;
+    }
+
+    IOIteratorReset(iter);
+    size_t idx = 0;
+    while ((service = IOIteratorNext(iter)) && idx < count) {
+        if (is_changer_device(service)) {
+            get_vendor_product(service, list[idx].vendor, sizeof(list[idx].vendor),
+                              list[idx].product, sizeof(list[idx].product));
+            io_string_t path;
+            if (IORegistryEntryGetPath(service, kIOServicePlane, path) == KERN_SUCCESS) {
+                strncpy(list[idx].path, path, sizeof(list[idx].path) - 1);
+            }
+            idx++;
+        }
+        IOObjectRelease(service);
+    }
+    IOObjectRelease(iter);
+
+    *out_list = list;
+    *out_count = idx;
+    return XL1B_OK;
+}
+
+void xl1b_free_changer_list(XL1BChangerInfo *list) {
+    free(list);
+}
+
+/* Open a changer device */
+XL1BChanger *xl1b_open(const char *device_name) {
+    return xl1b_open_ex(device_name, false, false);
+}
+
+XL1BChanger *xl1b_open_ex(const char *device_name, bool force, bool skip_tur) {
+    (void)device_name; /* TODO: support opening specific device by name */
+
+    XL1BChanger *changer = calloc(1, sizeof(XL1BChanger));
+    if (!changer) return NULL;
+
+    changer->internal = open_changer(!force);
+    if (!changer->internal.service && !changer->internal.sbp2_lun) {
+        free(changer);
+        return NULL;
+    }
+
+    if (!skip_tur && !force) {
+        if (cmd_test_unit_ready(&changer->internal) != 0) {
+            close_changer(&changer->internal);
+            free(changer);
+            return NULL;
+        }
+    }
+
+    return changer;
+}
+
+void xl1b_close(XL1BChanger *changer) {
+    if (!changer) return;
+    close_changer(&changer->internal);
+    free(changer);
+}
+
+/* Get element map */
+int xl1b_get_element_map(XL1BChanger *changer, XL1BElementMap *out_map) {
+    if (!changer || !out_map) return XL1B_ERR_INVALID;
+
+    memset(out_map, 0, sizeof(*out_map));
+
+    ElementMap internal_map = {0};
+    int rc = fetch_element_map(&changer->internal, &internal_map);
+    if (rc != 0) return XL1B_ERR_SCSI;
+
+    /* Copy to public structure */
+    if (internal_map.slots.count > 0) {
+        out_map->slot_addrs = malloc(internal_map.slots.count * sizeof(uint16_t));
+        if (out_map->slot_addrs) {
+            memcpy(out_map->slot_addrs, internal_map.slots.addrs,
+                   internal_map.slots.count * sizeof(uint16_t));
+            out_map->slot_count = internal_map.slots.count;
+        }
+    }
+
+    if (internal_map.drives.count > 0) {
+        out_map->drive_addrs = malloc(internal_map.drives.count * sizeof(uint16_t));
+        if (out_map->drive_addrs) {
+            memcpy(out_map->drive_addrs, internal_map.drives.addrs,
+                   internal_map.drives.count * sizeof(uint16_t));
+            out_map->drive_count = internal_map.drives.count;
+        }
+    }
+
+    if (internal_map.transports.count > 0) {
+        out_map->transport_addrs = malloc(internal_map.transports.count * sizeof(uint16_t));
+        if (out_map->transport_addrs) {
+            memcpy(out_map->transport_addrs, internal_map.transports.addrs,
+                   internal_map.transports.count * sizeof(uint16_t));
+            out_map->transport_count = internal_map.transports.count;
+        }
+    }
+
+    if (internal_map.ie.count > 0) {
+        out_map->ie_addrs = malloc(internal_map.ie.count * sizeof(uint16_t));
+        if (out_map->ie_addrs) {
+            memcpy(out_map->ie_addrs, internal_map.ie.addrs,
+                   internal_map.ie.count * sizeof(uint16_t));
+            out_map->ie_count = internal_map.ie.count;
+        }
+    }
+
+    element_map_free(&internal_map);
+    return XL1B_OK;
+}
+
+void xl1b_free_element_map(XL1BElementMap *map) {
+    if (!map) return;
+    free(map->slot_addrs);
+    free(map->drive_addrs);
+    free(map->transport_addrs);
+    free(map->ie_addrs);
+    memset(map, 0, sizeof(*map));
+}
+
+/* Get element status */
+int xl1b_get_slot_status(XL1BChanger *changer, int slot, XL1BElementStatus *out_status) {
+    if (!changer || !out_status || slot < 1) return XL1B_ERR_INVALID;
+
+    ElementMap map = {0};
+    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+
+    if ((size_t)slot > map.slots.count) {
+        element_map_free(&map);
+        return XL1B_ERR_INVALID;
+    }
+
+    uint16_t slot_addr = map.slots.addrs[slot - 1];
+    uint16_t drive_addr = map.drives.count > 0 ? map.drives.addrs[0] : 0;
+
+    ElementStatus internal_st = {0};
+    int rc = read_element_status_info(&changer->internal, drive_addr, NULL, slot_addr, &internal_st);
+    element_map_free(&map);
+
+    if (rc != 0) return XL1B_ERR_SCSI;
+
+    out_status->address = internal_st.addr;
+    out_status->full = internal_st.full;
+    out_status->except = false; /* TODO: extract from flags */
+    out_status->valid_source = internal_st.valid_src;
+    out_status->source_addr = internal_st.src_addr;
+
+    return XL1B_OK;
+}
+
+int xl1b_get_drive_status(XL1BChanger *changer, int drive, XL1BElementStatus *out_status) {
+    if (!changer || !out_status || drive < 1) return XL1B_ERR_INVALID;
+
+    ElementMap map = {0};
+    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+
+    if ((size_t)drive > map.drives.count) {
+        element_map_free(&map);
+        return XL1B_ERR_INVALID;
+    }
+
+    uint16_t drive_addr = map.drives.addrs[drive - 1];
+
+    ElementStatus internal_st = {0};
+    int rc = read_element_status_info(&changer->internal, drive_addr, &internal_st, 0, NULL);
+    element_map_free(&map);
+
+    if (rc != 0) return XL1B_ERR_SCSI;
+
+    out_status->address = internal_st.addr;
+    out_status->full = internal_st.full;
+    out_status->except = false;
+    out_status->valid_source = internal_st.valid_src;
+    out_status->source_addr = internal_st.src_addr;
+
+    return XL1B_OK;
+}
+
+/* Load a disc from slot into drive */
+int xl1b_load_slot(XL1BChanger *changer, int slot, int drive) {
+    return xl1b_load_slot_verbose(changer, slot, drive, NULL, NULL);
+}
+
+int xl1b_load_slot_verbose(XL1BChanger *changer, int slot, int drive,
+                           XL1BMountCallback callback, void *context) {
+    if (!changer || slot < 1 || drive < 1) return XL1B_ERR_INVALID;
+
+    ElementMap map = {0};
+    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+
+    if ((size_t)slot > map.slots.count || (size_t)drive > map.drives.count) {
+        element_map_free(&map);
+        return XL1B_ERR_INVALID;
+    }
+
+    uint16_t transport = map.transports.count > 0 ? map.transports.addrs[0] : 0;
+    uint16_t slot_addr = map.slots.addrs[slot - 1];
+    uint16_t drive_addr = map.drives.addrs[drive - 1];
+
+    /* Check current status */
+    ElementStatus drive_st = {0}, slot_st = {0};
+    if (read_element_status_info(&changer->internal, drive_addr, &drive_st, slot_addr, &slot_st) != 0) {
+        element_map_free(&map);
+        return XL1B_ERR_SCSI;
+    }
+
+    /* Already loaded? */
+    if (!slot_st.full && drive_st.full && drive_st.valid_src && drive_st.src_addr == slot_addr) {
+        element_map_free(&map);
+        return XL1B_OK;
+    }
+
+    /* Slot empty and disc not in drive? */
+    if (!slot_st.full && !(drive_st.full && drive_st.valid_src && drive_st.src_addr == slot_addr)) {
+        element_map_free(&map);
+        return XL1B_ERR_EMPTY;
+    }
+
+    int rc = 0;
+
+    /* If drive has a different disc, unload it first */
+    if (drive_st.full) {
+        uint16_t unload_addr = drive_st.valid_src ? drive_st.src_addr : slot_addr;
+        eject_optical_media();
+        rc = cmd_move_medium(&changer->internal, transport, drive_addr, unload_addr);
+        if (rc != 0) {
+            element_map_free(&map);
+            return XL1B_ERR_SCSI;
+        }
+    }
+
+    /* Load the disc */
+    rc = cmd_move_medium(&changer->internal, transport, slot_addr, drive_addr);
+    element_map_free(&map);
+
+    if (rc != 0) return XL1B_ERR_SCSI;
+
+    /* Notify about mounted disc if callback provided */
+    if (callback) {
+        char name[256] = {0}, size[64] = {0};
+        xl1b_wait_for_mount(name, sizeof(name), size, sizeof(size), 30);
+        callback(name[0] ? name : "Unknown", size[0] ? size : "?", context);
+    }
+
+    return XL1B_OK;
+}
+
+/* Unload the drive to a specific slot */
+int xl1b_unload_drive(XL1BChanger *changer, int slot, int drive) {
+    if (!changer || slot < 1 || drive < 1) return XL1B_ERR_INVALID;
+
+    ElementMap map = {0};
+    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+
+    if ((size_t)slot > map.slots.count || (size_t)drive > map.drives.count) {
+        element_map_free(&map);
+        return XL1B_ERR_INVALID;
+    }
+
+    uint16_t transport = map.transports.count > 0 ? map.transports.addrs[0] : 0;
+    uint16_t slot_addr = map.slots.addrs[slot - 1];
+    uint16_t drive_addr = map.drives.addrs[drive - 1];
+
+    eject_optical_media();
+    int rc = cmd_move_medium(&changer->internal, transport, drive_addr, slot_addr);
+    element_map_free(&map);
+
+    return rc == 0 ? XL1B_OK : XL1B_ERR_SCSI;
+}
+
+/* Eject a disc to the import/export slot */
+int xl1b_eject(XL1BChanger *changer, int slot, int drive) {
+    if (!changer || slot < 1 || drive < 1) return XL1B_ERR_INVALID;
+
+    ElementMap map = {0};
+    if (fetch_element_map(&changer->internal, &map) != 0) return XL1B_ERR_SCSI;
+
+    if ((size_t)slot > map.slots.count || (size_t)drive > map.drives.count || map.ie.count == 0) {
+        element_map_free(&map);
+        return XL1B_ERR_INVALID;
+    }
+
+    uint16_t transport = map.transports.count > 0 ? map.transports.addrs[0] : 0;
+    uint16_t slot_addr = map.slots.addrs[slot - 1];
+    uint16_t drive_addr = map.drives.addrs[drive - 1];
+    uint16_t ie_addr = map.ie.addrs[0];
+
+    /* Check if disc is in drive */
+    ElementStatus drive_st = {0}, slot_st = {0};
+    if (read_element_status_info(&changer->internal, drive_addr, &drive_st, slot_addr, &slot_st) != 0) {
+        element_map_free(&map);
+        return XL1B_ERR_SCSI;
+    }
+
+    int rc = 0;
+
+    /* If disc is in drive, unload to slot first */
+    if (!slot_st.full && drive_st.full) {
+        eject_optical_media();
+        rc = cmd_move_medium(&changer->internal, transport, drive_addr, slot_addr);
+        if (rc != 0) {
+            element_map_free(&map);
+            return XL1B_ERR_SCSI;
+        }
+    }
+
+    /* Move from slot to I/E */
+    rc = cmd_move_medium(&changer->internal, transport, slot_addr, ie_addr);
+    element_map_free(&map);
+
+    return rc == 0 ? XL1B_OK : XL1B_ERR_SCSI;
+}
+
+/* Low-level move medium */
+int xl1b_move_medium(XL1BChanger *changer, uint16_t transport, uint16_t source, uint16_t dest) {
+    if (!changer) return XL1B_ERR_INVALID;
+    return cmd_move_medium(&changer->internal, transport, source, dest) == 0 ? XL1B_OK : XL1B_ERR_SCSI;
+}
+
+/* Eject from macOS */
+int xl1b_eject_from_macos(void) {
+    return eject_optical_media();
+}
+
+/* Wait for mount */
+int xl1b_wait_for_mount(char *out_name, size_t name_len, char *out_size, size_t size_len, int timeout_secs) {
+    if (out_name && name_len > 0) out_name[0] = '\0';
+    if (out_size && size_len > 0) out_size[0] = '\0';
+
+    /* First check if already mounted */
+    if (get_mounted_disc_info(out_name, name_len, out_size, size_len)) {
+        return XL1B_OK;
+    }
+
+    /* Set up DiskArbitration session */
+    DASessionRef session = DASessionCreate(kCFAllocatorDefault);
+    if (!session) return XL1B_ERR_INVALID;
+
+    DACallbackContext ctx = {0};
+    bool timed_out = false;
+
+    DARegisterDiskAppearedCallback(session, NULL, disk_appeared_callback, &ctx);
+    DASessionScheduleWithRunLoop(session, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+
+    CFRunLoopTimerContext timerCtx = { 0, &timed_out, NULL, NULL, NULL };
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault,
+        CFAbsoluteTimeGetCurrent() + (double)timeout_secs, 0, 0, 0, timeout_callback, &timerCtx);
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+
+    CFRunLoopRun();
+
+    CFRunLoopRemoveTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+    CFRelease(timer);
+    DAUnregisterCallback(session, disk_appeared_callback, &ctx);
+    DASessionUnscheduleFromRunLoop(session, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+    CFRelease(session);
+
+    if (ctx.found) {
+        if (out_name && name_len > 0) strncpy(out_name, ctx.name, name_len - 1);
+        if (out_size && size_len > 0) strncpy(out_size, ctx.size, size_len - 1);
+        return XL1B_OK;
+    }
+
+    return timed_out ? XL1B_ERR_BUSY : XL1B_ERR_NOT_FOUND;
+}
+
+/* Device info */
+int xl1b_inquiry(XL1BChanger *changer, char *vendor, size_t vendor_len,
+                 char *product, size_t product_len, char *revision, size_t revision_len) {
+    if (!changer) return XL1B_ERR_INVALID;
+
+    uint8_t cdb[6] = {0x12, 0, 0, 0, 96, 0}; /* INQUIRY */
+    uint8_t buf[96] = {0};
+
+    int rc = execute_cdb(&changer->internal, cdb, sizeof(cdb), buf, sizeof(buf),
+                         kSCSIDataTransfer_FromTargetToInitiator, 10000);
+    if (rc != 0) return XL1B_ERR_SCSI;
+
+    if (vendor && vendor_len > 0) {
+        size_t len = vendor_len - 1 < 8 ? vendor_len - 1 : 8;
+        memcpy(vendor, buf + 8, len);
+        vendor[len] = '\0';
+        /* Trim trailing spaces */
+        while (len > 0 && vendor[len - 1] == ' ') vendor[--len] = '\0';
+    }
+
+    if (product && product_len > 0) {
+        size_t len = product_len - 1 < 16 ? product_len - 1 : 16;
+        memcpy(product, buf + 16, len);
+        product[len] = '\0';
+        while (len > 0 && product[len - 1] == ' ') product[--len] = '\0';
+    }
+
+    if (revision && revision_len > 0) {
+        size_t len = revision_len - 1 < 4 ? revision_len - 1 : 4;
+        memcpy(revision, buf + 32, len);
+        revision[len] = '\0';
+        while (len > 0 && revision[len - 1] == ' ') revision[--len] = '\0';
+    }
+
+    return XL1B_OK;
+}
+
+int xl1b_test_unit_ready(XL1BChanger *changer) {
+    if (!changer) return XL1B_ERR_INVALID;
+    return cmd_test_unit_ready(&changer->internal) == 0 ? XL1B_OK : XL1B_ERR_SCSI;
 }

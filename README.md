@@ -1,26 +1,136 @@
 # xl1b_changer
 
-Tools to interact with the Sony XL1B changer attached to this machine.
+A command-line tool to control SCSI media changer devices (jukeboxes/autoloaders) on macOS. Originally developed for the Sony VGP-XL1B disc changer but should work with other SCSI-compliant media changers.
+
+## Features
+
+- List and detect media changer devices (including FireWire SBP2 devices)
+- Load discs from storage slots into the drive
+- Unload discs from the drive back to storage slots
+- Eject discs to the import/export slot for physical removal
+- Automatic disc swapping (unloads current disc before loading a new one)
+- Automatic macOS disc ejection before physical media moves
+- Verbose mode shows mounted disc names and sizes
+
+## Requirements
+
+- macOS (tested on 10.15+)
+- A SCSI media changer device (FireWire or other supported interface)
 
 ## Build
+
+### CLI Tool
+
+```sh
+make
+```
+
+Or manually:
 
 ```sh
 cc -Wall -Wextra -O2 -o xl1b_changer xl1b_changer.c \
   -framework CoreFoundation \
-  -framework IOKit
+  -framework IOKit \
+  -framework DiskArbitration
+```
+
+### Library
+
+To build as a static library (for use in other applications):
+
+```sh
+make lib
+```
+
+This creates `libxl1b_changer.a`. Link against it and include `xl1b_changer.h`:
+
+```c
+#include "xl1b_changer.h"
+
+// Open the changer
+XL1BChanger *changer = xl1b_open(NULL);
+
+// Load slot 1 into the drive
+xl1b_load_slot(changer, 1, 1);
+
+// Close when done
+xl1b_close(changer);
+```
+
+Link with:
+```sh
+cc -o myapp myapp.c -L. -lxl1b_changer \
+  -framework CoreFoundation -framework IOKit -framework DiskArbitration
 ```
 
 ## Usage
 
+### List available changers
+
 ```sh
-./xl1b_changer list
-./xl1b_changer inquiry
-./xl1b_changer list-map
-./xl1b_changer load-slot --slot 1 --drive 1 --dry-run
+./xl1b_changer list          # List changers with brief info
+./xl1b_changer list-all      # List all changers including non-standard
+./xl1b_changer list-map      # Show element addresses (slots, drives, etc.)
 ```
 
-## Notes
+### Load a disc into the drive
 
-- Use `--confirm` for interactive confirmation before moving media.
-- Use `--force` to bypass device ID and TUR checks.
-- Use `--debug` to print IORegistry details for troubleshooting.
+```sh
+./xl1b_changer load-slot --slot 1              # Load slot 1 into drive
+./xl1b_changer load-slot --slot 2 -v           # Load slot 2 with verbose output
+./xl1b_changer load-slot --slot 1 --dry-run    # Show what would happen
+```
+
+If a disc is already in the drive, it will automatically be unloaded to its original slot first.
+
+### Unload the drive
+
+```sh
+./xl1b_changer unload-drive --slot 1           # Unload drive to slot 1
+```
+
+### Eject a disc from the machine
+
+```sh
+./xl1b_changer eject --slot 1                  # Eject disc from slot 1 to I/E slot
+```
+
+If the disc is currently in the drive, it will be unloaded first, then moved to the import/export slot where you can physically remove it.
+
+### Device information
+
+```sh
+./xl1b_changer inquiry                         # Show device inquiry data
+./xl1b_changer test-unit-ready                 # Check if device is ready
+./xl1b_changer mode-sense-element              # Show element address assignment
+./xl1b_changer read-element-status --element-type all --start 0 --count 50 --alloc 4096
+```
+
+## Options
+
+| Option | Description |
+|--------|-------------|
+| `--slot <n>` | Slot number (1-based) |
+| `--drive <n>` | Drive number (default: 1) |
+| `--transport <addr>` | Transport element address (usually auto-detected) |
+| `--dry-run` | Show what would happen without moving media |
+| `--confirm` | Require interactive confirmation before moves |
+| `--force` | Bypass device ID and TEST UNIT READY checks |
+| `--no-tur` | Skip TEST UNIT READY check |
+| `--verbose`, `-v` | Show mounted disc info during operations |
+| `--debug` | Print IORegistry details for troubleshooting |
+
+## How It Works
+
+The tool communicates with the media changer using SCSI Media Changer (SMC) commands:
+
+- `READ ELEMENT STATUS` (0xB8) - Query status of slots, drives, and transport
+- `MOVE MEDIUM` (0xA5) - Move media between elements
+- `MODE SENSE` (0x1A) - Get element address assignments
+- Standard SCSI commands (INQUIRY, TEST UNIT READY, etc.)
+
+For FireWire devices, it uses the IOFireWireSBP2 interface to send SCSI commands over the Serial Bus Protocol.
+
+## License
+
+MIT License - See LICENSE file for details.
