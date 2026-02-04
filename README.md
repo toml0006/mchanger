@@ -14,8 +14,12 @@ A command-line tool to control SCSI media changer devices (jukeboxes/autoloaders
 
 ## Requirements
 
-- macOS (tested on 10.15+)
-- A SCSI media changer device (FireWire or other supported interface)
+- macOS 10.4 (Tiger) or later
+  - Tested on macOS 10.15 (Catalina) through macOS 16 (Tahoe)
+  - Uses CoreFoundation, IOKit, and DiskArbitration frameworks
+- A SCSI media changer device connected via:
+  - FireWire (built-in port or Thunderbolt-to-FireWire adapter)
+  - Other SCSI interfaces supported by macOS
 
 ## Build
 
