@@ -25,9 +25,19 @@ Should work with other SCSI-compliant media changers, assuming you can find one.
 
 > **Important:** macOS 16 (Tahoe) [removed FireWire support entirely](https://tidbits.com/2025/09/19/support-for-firewire-removed-from-macos-26-tahoe/). If your changer connects via FireWire, you must use macOS 15 (Sequoia) or earlier. Plan your OS upgrades accordingly, or don't!
 
-## Build
+## Installation
 
-### CLI Tool
+### Homebrew
+
+```sh
+brew install toml0006/mchanger/mchanger
+```
+
+### Pre-built binary
+
+Download the latest universal binary from [Releases](https://github.com/toml0006/mchanger/releases).
+
+### Build from source
 
 ```sh
 make
@@ -42,7 +52,7 @@ cc -Wall -Wextra -O2 -o mchanger mchanger.c \
   -framework DiskArbitration
 ```
 
-### Library
+#### Library
 
 To build as a static library (for use in other applications):
 
