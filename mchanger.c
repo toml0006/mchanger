@@ -92,14 +92,14 @@ static void print_usage(const char *argv0) {
         "  %s init-status\n"
         "  %s read-element-status --element-type <all|transport|storage|ie|drive>\n"
         "                           --start <addr> --count <n> --alloc <bytes> [--raw]\n"
-        "  %s move --transport <addr> --source <addr> --dest <addr>\n"
         "  %s list-map\n"
         "  %s sanity-check\n"
-        "  %s load-slot --slot <n> [--drive <n>] [--transport <addr>]\n"
-        "  %s unload-drive --slot <n> [--drive <n>] [--transport <addr>]\n"
-        "  %s eject --slot <n> [--drive <n>] [--transport <addr>]\n"
-        "  %s load --transport <addr> --slot <addr> --drive <addr>\n"
-        "  %s unload --transport <addr> --drive <addr> --slot <addr>\n"
+        "  %s insert --slot <n> [--transport <addr>]     (IE port -> slot)\n"
+        "  %s retrieve --slot <n> [--transport <addr>]   (slot -> IE port)\n"
+        "  %s load --slot <n> [--drive <n>] [--transport <addr>]   (slot -> drive)\n"
+        "  %s unload --slot <n> [--drive <n>] [--transport <addr>] (drive -> slot)\n"
+        "  %s eject --slot <n> [--drive <n>] [--transport <addr>]  (load, eject, unload)\n"
+        "  %s move --transport <addr> --source <addr> --dest <addr> (low-level)\n"
         "\n"
         "Notes:\n"
         "- Addresses are element addresses from READ ELEMENT STATUS.\n"
@@ -1897,19 +1897,24 @@ static int cmd_move_medium(ChangerHandle *handle, uint16_t transport, uint16_t s
 }
 
 static int fetch_element_map(ChangerHandle *handle, ElementMap *map) {
-    uint32_t alloc = 4096;
+    uint32_t alloc = 65535;
+    uint8_t *buf = calloc(1, alloc);
+    if (!buf) return 1;
+
+    // First query "all types" to get transport, IE, and drive elements
+    // (Some devices only respond to "all types" for these element types)
     uint8_t cdb[12] = {0};
     cdb[0] = 0xB8; // READ ELEMENT STATUS
     cdb[1] = 0x00; // all element types
-    cdb[4] = 0xFF; // request all available elements
-    cdb[5] = 0xFF;
+    cdb[2] = 0x00; // starting element address (high)
+    cdb[3] = 0x00; // starting element address (low)
+    cdb[4] = 0xFF; // number of elements (high) - request maximum
+    cdb[5] = 0xFF; // number of elements (low)
     cdb[6] = (alloc >> 16) & 0xFF;
     cdb[7] = (alloc >> 8) & 0xFF;
     cdb[8] = alloc & 0xFF;
 
-    uint8_t *buf = calloc(1, alloc);
-    if (!buf) return 1;
-    int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 30000);
+    int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 60000);
     if (rc != 0) {
         free(buf);
         return rc;
@@ -1920,26 +1925,72 @@ static int fetch_element_map(ChangerHandle *handle, ElementMap *map) {
         free(buf);
         return 1;
     }
-    uint32_t needed = report_bytes + 8;
-    if (needed > alloc && needed < 65535) {
-        free(buf);
-        alloc = needed;
-        buf = calloc(1, alloc);
-        if (!buf) return 1;
-        cdb[6] = (alloc >> 16) & 0xFF;
-        cdb[7] = (alloc >> 8) & 0xFF;
-        cdb[8] = alloc & 0xFF;
-        rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 30000);
-        if (rc != 0) {
-            free(buf);
-            return rc;
+
+    uint32_t parse_len = (report_bytes + 8 <= alloc) ? report_bytes + 8 : alloc;
+    (void)parse_element_status_map(buf, parse_len, map);
+
+    // Now query storage elements separately - some devices return truncated
+    // storage lists when using "all types" but return full lists when querying
+    // storage specifically. Some devices also paginate results (max ~40 per query).
+    ElementAddrAssignment assign = {0};
+    if (read_mode_sense_element(handle, &assign, false) == 0 && assign.num_storage > 0) {
+        // Clear existing slots - we'll rebuild from paginated queries
+        free(map->slots.addrs);
+        map->slots.addrs = NULL;
+        map->slots.count = 0;
+        map->slots.cap = 0;
+
+        // Paginate through storage elements - device may return max ~40 per query
+        uint16_t start_addr = assign.first_storage;
+        uint16_t remaining = assign.num_storage;
+
+        while (remaining > 0) {
+            memset(cdb, 0, sizeof(cdb));
+            cdb[0] = 0xB8; // READ ELEMENT STATUS
+            cdb[1] = 0x02; // storage elements only
+            cdb[2] = (start_addr >> 8) & 0xFF;
+            cdb[3] = start_addr & 0xFF;
+            cdb[4] = (remaining >> 8) & 0xFF;
+            cdb[5] = remaining & 0xFF;
+            cdb[6] = (alloc >> 16) & 0xFF;
+            cdb[7] = (alloc >> 8) & 0xFF;
+            cdb[8] = alloc & 0xFF;
+
+            memset(buf, 0, alloc);
+            rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 60000);
+            if (rc != 0) break;
+
+            report_bytes = (buf[5] << 16) | (buf[6] << 8) | buf[7];
+            if (report_bytes == 0) break;
+
+            // Parse this page of results
+            parse_len = (report_bytes + 8 <= alloc) ? report_bytes + 8 : alloc;
+            size_t before = map->slots.count;
+            (void)parse_element_status_map(buf, parse_len, map);
+            size_t added = map->slots.count - before;
+
+            if (added == 0) break; // No new elements, stop pagination
+
+            // Move to next page
+            start_addr += (uint16_t)added;
+            if (added >= remaining) break;
+            remaining -= (uint16_t)added;
+        }
+
+        // Fill in missing slots from MODE SENSE if device didn't return all
+        // Some devices (like VGP-XL1B) have firmware quirks where READ ELEMENT STATUS
+        // doesn't return all slots even though they physically exist
+        if (map->slots.count < assign.num_storage) {
+            uint16_t expected_end = assign.first_storage + assign.num_storage;
+            uint16_t actual_end = assign.first_storage + (uint16_t)map->slots.count;
+            for (uint16_t addr = actual_end; addr < expected_end; addr++) {
+                element_list_push(&map->slots, addr);
+            }
         }
     }
 
-    uint32_t parse_len = (report_bytes + 8 <= alloc) ? report_bytes + 8 : alloc;
-    bool ok = parse_element_status_map(buf, parse_len, map);
     free(buf);
-    return ok ? 0 : 1;
+    return (map->transports.count + map->slots.count + map->drives.count + map->ie.count) > 0 ? 0 : 1;
 }
 
 static void print_element_map(const ElementMap *map) {
@@ -1970,10 +2021,18 @@ static void warn_if_slot_mismatch(ChangerHandle *handle, const ElementMap *map) 
     }
     if (assign.num_storage > 0 && map->slots.count > 0 &&
         assign.num_storage != map->slots.count) {
-        fprintf(stderr,
-                "Warning: MODE SENSE reports %u storage elements, "
-                "but READ ELEMENT STATUS returned %zu slots.\n",
-                assign.num_storage, map->slots.count);
+        if (map->slots.count < assign.num_storage / 2) {
+            // Significant mismatch - likely missing magazines
+            fprintf(stderr,
+                    "Warning: Device capacity is %u slots but only %zu are responding.\n"
+                    "         Check that all magazines are properly installed.\n",
+                    assign.num_storage, map->slots.count);
+        } else {
+            fprintf(stderr,
+                    "Note: MODE SENSE reports max capacity of %u slots, "
+                    "device reports %zu installed.\n",
+                    assign.num_storage, map->slots.count);
+        }
     }
 }
 
@@ -2217,7 +2276,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Failed to read element map.\n");
         }
         element_map_free(&map);
-    } else if (strcmp(argv[1], "load-slot") == 0) {
+    } else if (strcmp(argv[1], "load") == 0 || strcmp(argv[1], "load-slot") == 0) {
         size_t slot_index = 0, drive_index = 1; // default to drive 1
         bool have_slot = false;
         bool have_transport = false;
@@ -2372,7 +2431,7 @@ int main(int argc, char **argv) {
             wait_and_print_mounted_disc();
         }
         element_map_free(&map);
-    } else if (strcmp(argv[1], "unload-drive") == 0) {
+    } else if (strcmp(argv[1], "unload") == 0 || strcmp(argv[1], "unload-drive") == 0) {
         size_t slot_index = 0, drive_index = 1; // default to drive 1
         bool have_slot = false;
         bool have_transport = false;
@@ -2577,32 +2636,143 @@ int main(int argc, char **argv) {
             printf("Disc ejected to I/E slot. You can now remove it from the changer.\n");
         }
         element_map_free(&map);
-    } else if (strcmp(argv[1], "load") == 0) {
-        uint16_t transport = 0, slot = 0, drive = 0;
-        bool have_transport = false, have_slot = false, have_drive = false;
+    } else if (strcmp(argv[1], "insert") == 0) {
+        // Insert a disc from the IE port into a slot
+        size_t slot_index = 0;
+        bool have_slot = false;
+        bool have_transport = false;
+        uint16_t transport = 0;
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--transport") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--slot") == 0 && i + 1 < argc) {
+                have_slot = parse_index(argv[++i], &slot_index);
+            } else if (strcmp(argv[i], "--transport") == 0 && i + 1 < argc) {
                 have_transport = parse_u16(argv[++i], &transport);
-            } else if (strcmp(argv[i], "--slot") == 0 && i + 1 < argc) {
-                have_slot = parse_u16(argv[++i], &slot);
-            } else if (strcmp(argv[i], "--drive") == 0 && i + 1 < argc) {
-                have_drive = parse_u16(argv[++i], &drive);
             }
         }
-        if (!have_transport || !have_slot || !have_drive) {
-            fprintf(stderr, "Missing --transport, --slot, or --drive.\n");
+        if (!have_slot) {
+            fprintf(stderr, "Missing --slot.\n");
             rc = 1; goto out;
         }
+        ElementMap map = {0};
+        rc = fetch_element_map(&handle, &map);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to read element map.\n");
+            element_map_free(&map);
+            goto out;
+        }
+        if (slot_index == 0 || slot_index > map.slots.count) {
+            fprintf(stderr, "Slot out of range. Slots: %zu\n", map.slots.count);
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+        if (map.ie.count == 0) {
+            fprintf(stderr, "No import/export element found.\n");
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+        if (!have_transport) {
+            if (map.transports.count == 0) {
+                fprintf(stderr, "No transport element found.\n");
+                rc = 1;
+                element_map_free(&map);
+                goto out;
+            }
+            transport = map.transports.addrs[0];
+        }
+        uint16_t slot_addr = map.slots.addrs[slot_index - 1];
+        uint16_t ie_addr = map.ie.addrs[0];
+
+        printf("INSERT: IE(0x%04x) -> slot %zu(0x%04x)\n", ie_addr, slot_index, slot_addr);
+        printf("Place a disc in the IE port, then press Enter to continue...\n");
+        if (!dry_run) {
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF);
+        }
+
         if (dry_run) {
             printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x\n",
-                   transport, slot, drive);
+                   transport, ie_addr, slot_addr);
         } else {
             if (confirm && !confirm_move()) {
                 fprintf(stderr, "Aborted.\n");
-                rc = 1; goto out;
+                rc = 1;
+                element_map_free(&map);
+                goto out;
             }
-            rc = cmd_move_medium(&handle, transport, slot, drive);
+            rc = cmd_move_medium(&handle, transport, ie_addr, slot_addr);
+            if (rc == 0) {
+                printf("Disc inserted into slot %zu.\n", slot_index);
+            }
         }
+        element_map_free(&map);
+    } else if (strcmp(argv[1], "retrieve") == 0) {
+        // Retrieve a disc from a slot to the IE port
+        size_t slot_index = 0;
+        bool have_slot = false;
+        bool have_transport = false;
+        uint16_t transport = 0;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--slot") == 0 && i + 1 < argc) {
+                have_slot = parse_index(argv[++i], &slot_index);
+            } else if (strcmp(argv[i], "--transport") == 0 && i + 1 < argc) {
+                have_transport = parse_u16(argv[++i], &transport);
+            }
+        }
+        if (!have_slot) {
+            fprintf(stderr, "Missing --slot.\n");
+            rc = 1; goto out;
+        }
+        ElementMap map = {0};
+        rc = fetch_element_map(&handle, &map);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to read element map.\n");
+            element_map_free(&map);
+            goto out;
+        }
+        if (slot_index == 0 || slot_index > map.slots.count) {
+            fprintf(stderr, "Slot out of range. Slots: %zu\n", map.slots.count);
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+        if (map.ie.count == 0) {
+            fprintf(stderr, "No import/export element found.\n");
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+        if (!have_transport) {
+            if (map.transports.count == 0) {
+                fprintf(stderr, "No transport element found.\n");
+                rc = 1;
+                element_map_free(&map);
+                goto out;
+            }
+            transport = map.transports.addrs[0];
+        }
+        uint16_t slot_addr = map.slots.addrs[slot_index - 1];
+        uint16_t ie_addr = map.ie.addrs[0];
+
+        printf("RETRIEVE: slot %zu(0x%04x) -> IE(0x%04x)\n", slot_index, slot_addr, ie_addr);
+
+        if (dry_run) {
+            printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x\n",
+                   transport, slot_addr, ie_addr);
+        } else {
+            if (confirm && !confirm_move()) {
+                fprintf(stderr, "Aborted.\n");
+                rc = 1;
+                element_map_free(&map);
+                goto out;
+            }
+            rc = cmd_move_medium(&handle, transport, slot_addr, ie_addr);
+            if (rc == 0) {
+                printf("Disc from slot %zu is now in the IE port. You can remove it.\n", slot_index);
+            }
+        }
+        element_map_free(&map);
     } else if (strcmp(argv[1], "unload") == 0) {
         uint16_t transport = 0, slot = 0, drive = 0;
         bool have_transport = false, have_slot = false, have_drive = false;

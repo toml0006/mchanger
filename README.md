@@ -7,9 +7,11 @@ Should work with other SCSI-compliant media changers, assuming you can find one.
 ## Features
 
 - List and detect media changer devices (including FireWire SBP2 devices)
-- Load discs from storage slots into the drive
-- Unload discs from the drive back to storage slots
-- Eject discs to the import/export slot for physical removal
+- **Insert** discs from the IE port into storage slots
+- **Retrieve** discs from storage slots to the IE port for removal
+- **Load** discs from storage slots into the drive for playback
+- **Unload** discs from the drive back to storage slots
+- **Eject** discs directly from drive to IE port (combined unload + retrieve)
 - Automatic disc swapping (unloads current disc before loading a new one)
 - Automatic macOS disc ejection before physical media moves
 - Verbose mode shows mounted disc names and sizes
@@ -91,12 +93,29 @@ cc -o myapp myapp.c -L. -lmchanger \
 ./mchanger list-map      # Show element addresses (slots, drives, etc.)
 ```
 
+### Insert a disc into the machine
+
+```sh
+./mchanger insert --slot 100               # Insert disc from IE port into slot 100
+./mchanger insert --slot 50 --dry-run      # Show what would happen
+```
+
+Place a disc in the import/export (IE) port, then run the command. The changer will move the disc into the specified slot.
+
+### Retrieve a disc from the machine
+
+```sh
+./mchanger retrieve --slot 100             # Move disc from slot 100 to IE port
+```
+
+Moves a disc from a storage slot to the IE port so you can physically remove it.
+
 ### Load a disc into the drive
 
 ```sh
-./mchanger load-slot --slot 1              # Load slot 1 into drive
-./mchanger load-slot --slot 2 -v           # Load slot 2 with verbose output
-./mchanger load-slot --slot 1 --dry-run    # Show what would happen
+./mchanger load --slot 1                   # Load slot 1 into drive
+./mchanger load --slot 2 -v                # Load slot 2 with verbose output
+./mchanger load --slot 1 --dry-run         # Show what would happen
 ```
 
 If a disc is already in the drive, it will automatically be unloaded to its original slot first.
@@ -104,16 +123,16 @@ If a disc is already in the drive, it will automatically be unloaded to its orig
 ### Unload the drive
 
 ```sh
-./mchanger unload-drive --slot 1           # Unload drive to slot 1
+./mchanger unload --slot 1                 # Unload drive to slot 1
 ```
 
 ### Eject a disc from the machine
 
 ```sh
-./mchanger eject --slot 1                  # Eject disc from slot 1 to I/E slot
+./mchanger eject --slot 1                  # Eject disc from slot 1 to IE port
 ```
 
-If the disc is currently in the drive, it will be unloaded first, then moved to the import/export slot where you can physically remove it. Yes, you do have to walk over to the machine for this part.
+If the disc is currently in the drive, it will be unloaded first, then moved to the IE port. This is a convenience command that combines `unload` + `retrieve`.
 
 ### Device information
 
