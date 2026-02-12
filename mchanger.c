@@ -3031,6 +3031,144 @@ int mchanger_get_drive_status(MChangerHandle *changer, int drive, MChangerElemen
     return MCHANGER_OK;
 }
 
+int mchanger_get_bulk_status(MChangerHandle *changer,
+                             const uint16_t *slot_addrs,
+                             size_t slot_count,
+                             uint16_t drive_addr,
+                             MChangerElementStatus *out_drive,
+                             MChangerElementStatus *out_slots,
+                             bool *out_drive_supported) {
+    if (!changer || !out_slots) return MCHANGER_ERR_INVALID;
+    if (slot_count > 0 && !slot_addrs) return MCHANGER_ERR_INVALID;
+
+    if (out_drive_supported) *out_drive_supported = false;
+
+    /* Initialize outputs to "empty/unknown" */
+    for (size_t i = 0; i < slot_count; i++) {
+        out_slots[i].address = slot_addrs[i];
+        out_slots[i].full = false;
+        out_slots[i].except = false;
+        out_slots[i].valid_source = false;
+        out_slots[i].source_addr = 0;
+    }
+
+    if (out_drive) {
+        out_drive->address = drive_addr;
+        out_drive->full = false;
+        out_drive->except = false;
+        out_drive->valid_source = false;
+        out_drive->source_addr = 0;
+    }
+
+    uint32_t alloc = 4096;
+    uint8_t cdb[12] = {0};
+    cdb[0] = 0xB8; // READ ELEMENT STATUS
+    cdb[1] = 0x00; // all element types
+    cdb[4] = 0xFF;
+    cdb[5] = 0xFF;
+    cdb[6] = (alloc >> 16) & 0xFF;
+    cdb[7] = (alloc >> 8) & 0xFF;
+    cdb[8] = alloc & 0xFF;
+
+    uint8_t *buf = calloc(1, alloc);
+    if (!buf) return MCHANGER_ERR_INVALID;
+
+    int rc = execute_cdb(&changer->internal, cdb, sizeof(cdb), buf, alloc,
+                         kSCSIDataTransfer_FromTargetToInitiator, 30000);
+    if (rc != 0) {
+        free(buf);
+        return MCHANGER_ERR_SCSI;
+    }
+
+    uint32_t report_bytes = (buf[5] << 16) | (buf[6] << 8) | buf[7];
+    uint32_t needed = report_bytes > 0 ? report_bytes + 8 : 0;
+    if (needed > alloc && needed < 65535) {
+        free(buf);
+        alloc = needed;
+        buf = calloc(1, alloc);
+        if (!buf) return MCHANGER_ERR_INVALID;
+        cdb[6] = (alloc >> 16) & 0xFF;
+        cdb[7] = (alloc >> 8) & 0xFF;
+        cdb[8] = alloc & 0xFF;
+
+        rc = execute_cdb(&changer->internal, cdb, sizeof(cdb), buf, alloc,
+                         kSCSIDataTransfer_FromTargetToInitiator, 30000);
+        if (rc != 0) {
+            free(buf);
+            return MCHANGER_ERR_SCSI;
+        }
+        report_bytes = (buf[5] << 16) | (buf[6] << 8) | buf[7];
+    }
+
+    uint32_t parse_len = alloc;
+    if (report_bytes > 0 && report_bytes + 8 < parse_len) {
+        parse_len = report_bytes + 8;
+    }
+    if (parse_len < 8) {
+        free(buf);
+        return MCHANGER_OK;
+    }
+
+    bool drive_page_present = false;
+
+    /* Parse element status pages (same wire format as read_element_status_info()) */
+    uint32_t offset = 8;
+    while (offset + 8 <= parse_len) {
+        uint8_t elem_type = buf[offset];
+        uint16_t desc_len = (buf[offset + 2] << 8) | buf[offset + 3];
+        uint32_t page_bytes = (buf[offset + 5] << 16) | (buf[offset + 6] << 8) | buf[offset + 7];
+        offset += 8;
+
+        if (desc_len == 0 || page_bytes == 0) break;
+
+        uint32_t page_end = offset + page_bytes;
+        if (page_end > parse_len) page_end = parse_len;
+
+        if (elem_type == 0x04) {
+            drive_page_present = true;
+        }
+
+        while (offset + desc_len <= page_end) {
+            uint16_t elem_addr = (buf[offset] << 8) | buf[offset + 1];
+            uint8_t elem_flags = buf[offset + 2];
+            bool full = (elem_flags & 0x01) != 0;
+
+            bool svalid = false;
+            uint16_t src = 0;
+            if (desc_len >= 12) {
+                svalid = (buf[offset + 9] & 0x80) != 0;
+                src = (buf[offset + 10] << 8) | buf[offset + 11];
+            }
+
+            if (out_drive && drive_addr != 0 && elem_addr == drive_addr) {
+                out_drive->full = full;
+                out_drive->valid_source = svalid;
+                out_drive->source_addr = src;
+            }
+
+            /* Fill any matching slot entry */
+            for (size_t i = 0; i < slot_count; i++) {
+                if (slot_addrs[i] == elem_addr) {
+                    out_slots[i].full = full;
+                    out_slots[i].valid_source = svalid;
+                    out_slots[i].source_addr = src;
+                    break;
+                }
+            }
+
+            offset += desc_len;
+        }
+
+        if (offset < page_end) {
+            offset = page_end;
+        }
+    }
+
+    if (out_drive_supported) *out_drive_supported = drive_page_present;
+    free(buf);
+    return MCHANGER_OK;
+}
+
 /* Load a disc from slot into drive */
 int mchanger_load_slot(MChangerHandle *changer, int slot, int drive) {
     return mchanger_load_slot_verbose(changer, slot, drive, NULL, NULL);

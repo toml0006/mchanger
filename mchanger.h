@@ -104,6 +104,24 @@ int mchanger_get_slot_status(MChangerHandle *changer, int slot, MChangerElementS
 int mchanger_get_drive_status(MChangerHandle *changer, int drive, MChangerElementStatus *out_status);
 
 /*
+ * Bulk status
+ *
+ * Read element status once and fill the provided slot array (and optional drive status).
+ *
+ * - slot_addrs/slot_count should come from a previously fetched element map.
+ * - drive_addr should be an element address from the map (pass 0 to skip drive status).
+ * - out_slots must have at least slot_count entries.
+ * - out_drive_supported, when non-NULL, is set to true iff a drive element status page was present.
+ */
+int mchanger_get_bulk_status(MChangerHandle *changer,
+                             const uint16_t *slot_addrs,
+                             size_t slot_count,
+                             uint16_t drive_addr,
+                             MChangerElementStatus *out_drive,
+                             MChangerElementStatus *out_slots,
+                             bool *out_drive_supported);
+
+/*
  * Operations
  */
 
