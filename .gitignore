@@ -1,6 +1,7 @@
 # Build outputs
 /mchanger
 /test_mchanger
+/dist/
 /vgp_changer/
 *.o
 *.a

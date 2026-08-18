@@ -90,6 +90,7 @@ static void print_usage(const char *argv0) {
         "  %s mode-sense-element\n"
         "  %s probe-storage\n"
         "  %s init-status\n"
+        "  %s probe-open-ie --ie <n> --confirm  (experimental: open I/E gate once)\n"
         "  %s read-element-status --element-type <all|transport|storage|ie|drive>\n"
         "                           --start <addr> --count <n> --alloc <bytes> [--raw]\n"
         "  %s list-map\n"
@@ -109,12 +110,40 @@ static void print_usage(const char *argv0) {
         "- Use --confirm to require interactive confirmation before moving media.\n"
         "- Use --debug to print IORegistry details for troubleshooting.\n"
         "- Use --verbose or -v to show mounted disc info during load/unload.\n",
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0
     );
 }
 
 static bool g_debug = false;
 static bool g_verbose = false;
+static int g_last_connect_error = MCHANGER_CONNECT_ERROR_NONE;
+static bool g_last_command_transient = false;
+static bool g_last_command_not_responding = false;
+static uint8_t g_last_sense_key = 0;
+static uint8_t g_last_sense_asc = 0;
+static uint8_t g_last_sense_ascq = 0;
+
+static void classify_io_error(IOReturn error) {
+    if (error == kIOReturnExclusiveAccess || error == kIOReturnBusy) {
+        g_last_connect_error = MCHANGER_CONNECT_ERROR_OWNED_ELSEWHERE;
+    } else if (error == kIOReturnNotResponding
+               || error == kIOReturnTimeout
+               || error == kIOReturnNoResources) {
+        g_last_connect_error = MCHANGER_CONNECT_ERROR_NOT_RESPONDING;
+    } else {
+        g_last_connect_error = MCHANGER_CONNECT_ERROR_OPEN_FAILED;
+    }
+}
+
+static void classify_command_io_error(IOReturn error) {
+    /* Busy means the task was not accepted and is safe to submit once more.
+       A timeout/not-responding result has ambiguous transport state on the
+       Sony FireWire bridge, so replaying it can wedge the LUN. */
+    g_last_command_transient = error == kIOReturnBusy;
+    g_last_command_not_responding = error == kIOReturnTimeout
+        || error == kIOReturnNotResponding
+        || error == kIOReturnNoResources;
+}
 
 static bool cfstring_equals(CFTypeRef value, const char *expected) {
     if (!value || CFGetTypeID(value) != CFStringGetTypeID()) {
@@ -125,6 +154,17 @@ static bool cfstring_equals(CFTypeRef value, const char *expected) {
         return false;
     }
     return strcmp(buffer, expected) == 0;
+}
+
+/* The same Sony changer reports two inquiry identities across FireWire bus
+   resets. Catalina commonly publishes the post-reset identity until the first
+   successful changer commands complete. Both names refer to the type-8 LUN in
+   this appliance and must use the SCSITask path. */
+static bool is_supported_changer_identity(CFTypeRef vendor, CFTypeRef product) {
+    return (cfstring_equals(vendor, "Sony")
+            && cfstring_equals(product, "VAIOChanger1"))
+        || (cfstring_equals(vendor, "PowrFile")
+            && cfstring_equals(product, "PowerFile R200DL"));
 }
 
 static void cfstring_to_c(CFTypeRef value, char *out, size_t out_len) {
@@ -168,7 +208,14 @@ static void get_vendor_product(io_service_t service,
 }
 
 static bool is_changer_device(io_service_t service) {
-    CFTypeRef type = IORegistryEntryCreateCFProperty(service, CFSTR("Peripheral Device Type"), kCFAllocatorDefault, 0);
+    CFTypeRef type = IORegistryEntryCreateCFProperty(
+        service, CFSTR("Peripheral Device Type"), kCFAllocatorDefault, 0);
+    if (!type) {
+        /* An SBP-2 changer LUN may never acquire an IOSCSI peripheral nub.
+           IOFireWireSBP2LUN publishes the same value under Device_Type. */
+        type = IORegistryEntryCreateCFProperty(
+            service, CFSTR("Device_Type"), kCFAllocatorDefault, 0);
+    }
     bool is_type8 = false;
     if (type && CFGetTypeID(type) == CFNumberGetTypeID()) {
         int value = 0;
@@ -256,6 +303,21 @@ static io_iterator_t match_scsi_devices(void) {
     CFMutableDictionaryRef match = IOServiceMatching("IOSCSIPeripheralDeviceNub");
     if (!match) {
         fprintf(stderr, "Failed to create IOService match dictionary.\n");
+        return IO_OBJECT_NULL;
+    }
+    io_iterator_t iter = IO_OBJECT_NULL;
+    kern_return_t kr = IOServiceGetMatchingServices(kIOMasterPortDefault, match, &iter);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "IOServiceGetMatchingServices failed: 0x%x\n", kr);
+        return IO_OBJECT_NULL;
+    }
+    return iter;
+}
+
+static io_iterator_t match_sbp2_luns(void) {
+    CFMutableDictionaryRef match = IOServiceMatching("IOFireWireSBP2LUN");
+    if (!match) {
+        fprintf(stderr, "Failed to create IOFireWireSBP2LUN match dictionary.\n");
         return IO_OBJECT_NULL;
     }
     io_iterator_t iter = IO_OBJECT_NULL;
@@ -538,13 +600,12 @@ static io_service_t find_changer_service(bool require_sony) {
         CFTypeRef vendor = IORegistryEntryCreateCFProperty(service, VENDOR_KEY, kCFAllocatorDefault, 0);
         CFTypeRef product = IORegistryEntryCreateCFProperty(service, PRODUCT_KEY, kCFAllocatorDefault, 0);
 
-        bool is_sony = cfstring_equals(vendor, "Sony");
-        bool is_vgp = cfstring_equals(product, "VAIOChanger1");
+        bool is_supported = is_supported_changer_identity(vendor, product);
 
         if (vendor) CFRelease(vendor);
         if (product) CFRelease(product);
 
-        if (is_sony && is_vgp) {
+        if (is_supported) {
             IOObjectRelease(iter);
             return service;
         }
@@ -596,6 +657,32 @@ static io_service_t find_sbp2_lun_service(const char *vendor, const char *produc
     return fallback;
 }
 
+static io_service_t find_sbp2_changer_service(bool require_sony) {
+    io_iterator_t iter = match_sbp2_luns();
+    if (iter == IO_OBJECT_NULL) return IO_OBJECT_NULL;
+
+    io_service_t service;
+    while ((service = IOIteratorNext(iter))) {
+        if (!is_changer_device(service)) {
+            IOObjectRelease(service);
+            continue;
+        }
+
+        CFTypeRef vendor = IORegistryEntryCreateCFProperty(
+            service, CFSTR("FireWire Vendor Name"), kCFAllocatorDefault, 0);
+        bool vendor_ok = !require_sony || cfstring_equals(vendor, "Sony");
+        if (vendor) CFRelease(vendor);
+        if (vendor_ok) {
+            IOObjectRelease(iter);
+            return service;
+        }
+        IOObjectRelease(service);
+    }
+
+    IOObjectRelease(iter);
+    return IO_OBJECT_NULL;
+}
+
 static ChangerHandle open_changer_scsitask(io_service_t service, const char *vendor_c, const char *product_c) {
     ChangerHandle handle = {0};
     handle.backend = BACKEND_SCSITASK;
@@ -607,8 +694,7 @@ static ChangerHandle open_changer_scsitask(io_service_t service, const char *ven
     }
     if (task_service == IO_OBJECT_NULL) {
         fprintf(stderr, "Failed to locate SCSITask device for changer.\n");
-        IOObjectRelease(handle.service);
-        handle.service = IO_OBJECT_NULL;
+        g_last_connect_error = MCHANGER_CONNECT_ERROR_OPEN_FAILED;
         return handle;
     }
 
@@ -652,8 +738,8 @@ static ChangerHandle open_changer_scsitask(io_service_t service, const char *ven
     IOObjectRelease(task_service);
     if (kr != KERN_SUCCESS || !plugin) {
         fprintf(stderr, "IOCreatePlugInInterfaceForService failed: 0x%x\n", kr);
-        IOObjectRelease(handle.service);
-        handle.service = IO_OBJECT_NULL;
+        classify_io_error(kr);
+        if (plugin) (*plugin)->Release(plugin);
         return handle;
     }
 
@@ -666,8 +752,7 @@ static ChangerHandle open_changer_scsitask(io_service_t service, const char *ven
 
     if (result || !handle.scsi_device) {
         fprintf(stderr, "QueryInterface for SCSITaskDeviceInterface failed.\n");
-        IOObjectRelease(handle.service);
-        handle.service = IO_OBJECT_NULL;
+        g_last_connect_error = MCHANGER_CONNECT_ERROR_OPEN_FAILED;
         return handle;
     }
 
@@ -675,7 +760,10 @@ static ChangerHandle open_changer_scsitask(io_service_t service, const char *ven
     if (ex == kIOReturnSuccess) {
         handle.has_exclusive = true;
     } else {
-        fprintf(stderr, "Warning: Could not obtain exclusive access (0x%x). Proceeding.\n", ex);
+        fprintf(stderr, "Could not obtain exclusive access to changer (0x%x).\n", ex);
+        classify_io_error(ex);
+        (*handle.scsi_device)->Release(handle.scsi_device);
+        handle.scsi_device = NULL;
     }
 
     return handle;
@@ -728,6 +816,7 @@ static ChangerHandle open_sbp2_lun_from_service(io_service_t service) {
     handle.service = service;
     if (handle.service == IO_OBJECT_NULL) {
         fprintf(stderr, "No SBP2 LUN service provided.\n");
+        g_last_connect_error = MCHANGER_CONNECT_ERROR_NOT_FOUND;
         return handle;
     }
 
@@ -769,6 +858,8 @@ static ChangerHandle open_sbp2_lun_from_service(io_service_t service) {
     );
     if (kr != KERN_SUCCESS || !plugin) {
         fprintf(stderr, "IOCreatePlugInInterfaceForService(SBP2) failed: 0x%x\n", kr);
+        classify_io_error(kr);
+        if (plugin) (*plugin)->Release(plugin);
         IOObjectRelease(handle.service);
         handle.service = IO_OBJECT_NULL;
         return handle;
@@ -782,6 +873,7 @@ static ChangerHandle open_sbp2_lun_from_service(io_service_t service) {
     (*plugin)->Release(plugin);
     if (result || !handle.sbp2_lun) {
         fprintf(stderr, "QueryInterface for SBP2 LUN failed.\n");
+        g_last_connect_error = MCHANGER_CONNECT_ERROR_OPEN_FAILED;
         IOObjectRelease(handle.service);
         handle.service = IO_OBJECT_NULL;
         return handle;
@@ -790,6 +882,9 @@ static ChangerHandle open_sbp2_lun_from_service(io_service_t service) {
     kr = (*handle.sbp2_lun)->open(handle.sbp2_lun);
     if (kr != kIOReturnSuccess) {
         fprintf(stderr, "SBP2 LUN open failed: 0x%x\n", kr);
+        classify_io_error(kr);
+        /* open() may create a kernel user client before reporting failure. */
+        (*handle.sbp2_lun)->close(handle.sbp2_lun);
         (*handle.sbp2_lun)->Release(handle.sbp2_lun);
         IOObjectRelease(handle.service);
         handle.sbp2_lun = NULL;
@@ -805,6 +900,7 @@ static ChangerHandle open_sbp2_lun_from_service(io_service_t service) {
     );
     if (!login_unknown) {
         fprintf(stderr, "Failed to create SBP2 login.\n");
+        g_last_connect_error = MCHANGER_CONNECT_ERROR_OPEN_FAILED;
         (*handle.sbp2_lun)->close(handle.sbp2_lun);
         (*handle.sbp2_lun)->Release(handle.sbp2_lun);
         IOObjectRelease(handle.service);
@@ -818,8 +914,14 @@ static ChangerHandle open_sbp2_lun_from_service(io_service_t service) {
     SBP2LoginWait waiter = {0};
     (*handle.sbp2_login)->setLoginCallback(handle.sbp2_login, &waiter, sbp2_login_callback);
     kr = (*handle.sbp2_login)->submitLogin(handle.sbp2_login);
-    if (kr != kIOReturnSuccess || !runloop_wait(&waiter.done, 5.0) || waiter.status != kIOReturnSuccess) {
+    bool login_completed = kr == kIOReturnSuccess && runloop_wait(&waiter.done, 5.0);
+    if (!login_completed || waiter.status != kIOReturnSuccess) {
         fprintf(stderr, "SBP2 login failed: 0x%x\n", kr);
+        if (!login_completed) {
+            g_last_connect_error = MCHANGER_CONNECT_ERROR_NOT_RESPONDING;
+        } else {
+            classify_io_error(waiter.status);
+        }
         (*handle.sbp2_login)->Release(handle.sbp2_login);
         (*handle.sbp2_lun)->close(handle.sbp2_lun);
         (*handle.sbp2_lun)->Release(handle.sbp2_lun);
@@ -847,8 +949,16 @@ static ChangerHandle open_changer(bool require_sony) {
     ChangerHandle handle = {0};
     handle.service = find_changer_service(require_sony);
     if (handle.service == IO_OBJECT_NULL) {
-        fprintf(stderr, "No changer device found.\n");
-        return handle;
+        /* Catalina can expose a type-8 FireWire LUN without creating an
+           IOSCSIPeripheralDeviceNub. Open that LUN through SBP-2 directly. */
+        handle.service = find_sbp2_changer_service(require_sony);
+        if (handle.service == IO_OBJECT_NULL) {
+            fprintf(stderr, "No changer device found.\n");
+            g_last_connect_error = MCHANGER_CONNECT_ERROR_NOT_FOUND;
+            return handle;
+        }
+        printf("Using FireWire SBP-2 changer LUN\n");
+        return open_sbp2_lun_from_service(handle.service);
     }
 
     CFTypeRef vendor = IORegistryEntryCreateCFProperty(handle.service, VENDOR_KEY, kCFAllocatorDefault, 0);
@@ -862,7 +972,11 @@ static ChangerHandle open_changer(bool require_sony) {
 
     printf("Using changer device: %s %s\n", vendor_c, product_c);
     if (require_sony) {
-        if (!(strcmp(vendor_c, "Sony") == 0 && strcmp(product_c, "VAIOChanger1") == 0)) {
+        bool supported = (strcmp(vendor_c, "Sony") == 0
+                          && strcmp(product_c, "VAIOChanger1") == 0)
+            || (strcmp(vendor_c, "PowrFile") == 0
+                && strcmp(product_c, "PowerFile R200DL") == 0);
+        if (!supported) {
             fprintf(stderr, "Device ID mismatch. Use --force to override.\n");
             IOObjectRelease(handle.service);
             handle.service = IO_OBJECT_NULL;
@@ -877,6 +991,10 @@ static ChangerHandle open_changer(bool require_sony) {
 
     IOObjectRelease(handle.service);
     handle.service = IO_OBJECT_NULL;
+    if (g_last_connect_error == MCHANGER_CONNECT_ERROR_OWNED_ELSEWHERE
+        || g_last_connect_error == MCHANGER_CONNECT_ERROR_NOT_RESPONDING) {
+        return handle;
+    }
     return open_changer_sbp2(vendor_c, product_c);
 }
 
@@ -904,14 +1022,18 @@ static void close_changer(ChangerHandle *handle) {
     }
 }
 
-static void dump_hex(const uint8_t *buf, size_t len) {
+static void dump_hex_to(FILE *stream, const uint8_t *buf, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if (i % 16 == 0) {
-            printf("\n%04zx: ", i);
+            fprintf(stream, "\n%04zx: ", i);
         }
-        printf("%02x ", buf[i]);
+        fprintf(stream, "%02x ", buf[i]);
     }
-    printf("\n");
+    fprintf(stream, "\n");
+}
+
+static void dump_hex(const uint8_t *buf, size_t len) {
+    dump_hex_to(stdout, buf, len);
 }
 
 static void element_list_free(ElementList *list) {
@@ -971,8 +1093,9 @@ static void print_sense(const SCSI_Sense_Data *sense) {
     uint8_t key = sense->SENSE_KEY & 0x0F;
     uint8_t asc = sense->ADDITIONAL_SENSE_CODE;
     uint8_t ascq = sense->ADDITIONAL_SENSE_CODE_QUALIFIER;
-    printf("Sense: valid=%u response=0x%02x key=%s(0x%02x) asc=0x%02x ascq=0x%02x\n",
-           valid ? 1 : 0, response, sense_key_name(key), key, asc, ascq);
+    fprintf(stderr,
+            "Sense: valid=%u response=0x%02x key=%s(0x%02x) asc=0x%02x ascq=0x%02x\n",
+            valid ? 1 : 0, response, sense_key_name(key), key, asc, ascq);
 }
 
 static int execute_cdb_scsitask(
@@ -984,6 +1107,11 @@ static int execute_cdb_scsitask(
     uint8_t direction,
     uint32_t timeout_ms
 ) {
+    g_last_command_transient = false;
+    g_last_command_not_responding = false;
+    g_last_sense_key = 0;
+    g_last_sense_asc = 0;
+    g_last_sense_ascq = 0;
     if (!handle || !handle->scsi_device) return 1;
 
     SCSITaskInterface **task = (*handle->scsi_device)->CreateSCSITask(handle->scsi_device);
@@ -1018,13 +1146,28 @@ static int execute_cdb_scsitask(
     IOReturn kr = (*task)->ExecuteTaskSync(task, &sense, &status, &transferred);
     if (kr != kIOReturnSuccess) {
         fprintf(stderr, "ExecuteTaskSync failed: 0x%x\n", kr);
+        classify_command_io_error(kr);
     }
 
     if (status != kSCSITaskStatus_GOOD) {
         fprintf(stderr, "SCSI task status: 0x%x\n", status);
         print_sense(&sense);
         fprintf(stderr, "Sense data:");
-        dump_hex((uint8_t *)&sense, sizeof(sense));
+        dump_hex_to(stderr, (uint8_t *)&sense, sizeof(sense));
+        uint8_t key = sense.SENSE_KEY & 0x0F;
+        g_last_sense_key = key;
+        g_last_sense_asc = sense.ADDITIONAL_SENSE_CODE;
+        g_last_sense_ascq = sense.ADDITIONAL_SENSE_CODE_QUALIFIER;
+        /* CHECK CONDITION with empty sense is not actionable and this bridge
+           can wedge when the same command is immediately replayed. Treat it
+           as an unresponsive transport, not as a retry invitation. */
+        bool empty_sense = key == kSENSE_KEY_NO_SENSE
+            && sense.ADDITIONAL_SENSE_CODE == 0
+            && sense.ADDITIONAL_SENSE_CODE_QUALIFIER == 0;
+        g_last_command_transient = key == kSENSE_KEY_UNIT_ATTENTION
+            || key == kSENSE_KEY_NOT_READY
+            || key == kSENSE_KEY_ABORTED_COMMAND;
+        g_last_command_not_responding = empty_sense;
     } else {
         if (buffer && buffer_len > 0) {
             printf("Transferred %llu bytes.\n", (unsigned long long)transferred);
@@ -1044,6 +1187,11 @@ static int execute_cdb_sbp2(
     uint8_t direction,
     uint32_t timeout_ms
 ) {
+    g_last_command_transient = false;
+    g_last_command_not_responding = false;
+    g_last_sense_key = 0;
+    g_last_sense_asc = 0;
+    g_last_sense_ascq = 0;
     if (!handle || !handle->sbp2_login) return 1;
 
     IUnknownVTbl **orb_unknown = (*handle->sbp2_login)->createORB(
@@ -1084,18 +1232,22 @@ static int execute_cdb_sbp2(
     IOReturn kr = (*handle->sbp2_login)->submitORB(handle->sbp2_login, orb);
     if (kr != kIOReturnSuccess) {
         fprintf(stderr, "submitORB failed: 0x%x\n", kr);
+        classify_command_io_error(kr);
         (*orb)->Release(orb);
         return 1;
     }
     kr = (*handle->sbp2_login)->ringDoorbell(handle->sbp2_login);
     if (kr != kIOReturnSuccess) {
         fprintf(stderr, "ringDoorbell failed: 0x%x\n", kr);
+        classify_command_io_error(kr);
         (*orb)->Release(orb);
         return 1;
     }
 
     if (!runloop_wait(&waiter.done, (double)timeout_ms / 1000.0 + 1.0)) {
         fprintf(stderr, "SBP2 command timed out.\n");
+        g_last_command_transient = true;
+        g_last_command_not_responding = true;
         (*orb)->Release(orb);
         return 1;
     }
@@ -1112,6 +1264,7 @@ static int execute_cdb_sbp2(
             const FWSBP2StatusBlock *sb = (const FWSBP2StatusBlock *)waiter.message;
             fprintf(stderr, "SBP2 status: 0x%02x details: 0x%02x\n", sb->sbpStatus, sb->details);
         }
+        g_last_command_transient = true;
         return 1;
     }
 
@@ -1120,6 +1273,20 @@ static int execute_cdb_sbp2(
     }
 
     return 0;
+}
+
+static bool cdb_is_retryable(const uint8_t *cdb, uint8_t cdb_len) {
+    if (!cdb || cdb_len == 0) return false;
+    switch (cdb[0]) {
+        case 0x00: /* TEST UNIT READY */
+        case 0x12: /* INQUIRY */
+        case 0x1A: /* MODE SENSE(6) */
+        case 0x4D: /* LOG SENSE */
+        case 0xB8: /* READ ELEMENT STATUS */
+            return true;
+        default:
+            return false;
+    }
 }
 
 static int execute_cdb(
@@ -1132,11 +1299,72 @@ static int execute_cdb(
     uint32_t timeout_ms
 ) {
     if (!handle) return 1;
-    if (handle->backend == BACKEND_SCSITASK) {
-        return execute_cdb_scsitask(handle, cdb, cdb_len, buffer, buffer_len, direction, timeout_ms);
+    /* Only read-only/idempotent commands may be replayed. MOVE MEDIUM (0xA5)
+       is intentionally never retried because its completion can be ambiguous. */
+    bool retryable = cdb_is_retryable(cdb, cdb_len);
+    /* At most one replay, and only when the failure proves the command is safe
+       to retry (for example UNIT ATTENTION). Higher-level recovery closes and
+       reopens the SCSI user client before trying another session. */
+    int attempts = retryable ? 2 : 1;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        int result;
+        if (handle->backend == BACKEND_SCSITASK) {
+            result = execute_cdb_scsitask(handle, cdb, cdb_len, buffer, buffer_len, direction, timeout_ms);
+        } else {
+            result = execute_cdb_sbp2(handle, cdb, cdb_len, buffer, buffer_len, direction, timeout_ms);
+        }
+        if (result == 0) return 0;
+        if (!g_last_command_transient || attempt + 1 == attempts) return result;
+        fprintf(stderr, "Transient SCSI failure for opcode 0x%02x; retrying (%d/%d).\n",
+                cdb[0], attempt + 2, attempts);
+        usleep((useconds_t)(250000 * (attempt + 1)));
     }
-    return execute_cdb_sbp2(handle, cdb, cdb_len, buffer, buffer_len, direction, timeout_ms);
+    return 1;
 }
+
+static int build_open_close_ie_cdb(uint16_t element_address, bool open,
+                                   uint8_t out_cdb[6]) {
+    if (!out_cdb) return MCHANGER_ERR_INVALID;
+    memset(out_cdb, 0, 6);
+    out_cdb[0] = 0x1B; /* OPEN/CLOSE IMPORT/EXPORT ELEMENT */
+    out_cdb[2] = (uint8_t)(element_address >> 8);
+    out_cdb[3] = (uint8_t)(element_address & 0xFF);
+    out_cdb[4] = open ? 0x00 : 0x01;
+    return MCHANGER_OK;
+}
+
+static int build_move_medium_cdb(uint16_t transport, uint16_t source,
+                                 uint16_t dest, uint8_t out_cdb[12]) {
+    if (!out_cdb) return MCHANGER_ERR_INVALID;
+    memset(out_cdb, 0, 12);
+    out_cdb[0] = 0xA5; /* MOVE MEDIUM */
+    out_cdb[2] = (uint8_t)(transport >> 8);
+    out_cdb[3] = (uint8_t)(transport & 0xFF);
+    out_cdb[4] = (uint8_t)(source >> 8);
+    out_cdb[5] = (uint8_t)(source & 0xFF);
+    out_cdb[6] = (uint8_t)(dest >> 8);
+    out_cdb[7] = (uint8_t)(dest & 0xFF);
+    return MCHANGER_OK;
+}
+
+#ifdef MCHANGER_TESTING
+int mchanger_test_build_open_close_ie_cdb(uint16_t element_address,
+                                          bool open,
+                                          uint8_t out_cdb[6]) {
+    return build_open_close_ie_cdb(element_address, open, out_cdb);
+}
+
+int mchanger_test_build_move_medium_cdb(uint16_t transport,
+                                        uint16_t source,
+                                        uint16_t dest,
+                                        uint8_t out_cdb[12]) {
+    return build_move_medium_cdb(transport, source, dest, out_cdb);
+}
+
+bool mchanger_test_cdb_is_retryable(const uint8_t *cdb, uint8_t cdb_len) {
+    return cdb_is_retryable(cdb, cdb_len);
+}
+#endif
 
 static int cmd_inquiry(ChangerHandle *handle) {
     uint8_t cdb[6] = {0};
@@ -1347,7 +1575,9 @@ static int cmd_test_unit_ready(ChangerHandle *handle) {
 static int cmd_init_status(ChangerHandle *handle) {
     uint8_t cdb[6] = {0};
     cdb[0] = 0x07; // INITIALIZE ELEMENT STATUS
-    return execute_cdb(handle, cdb, sizeof(cdb), NULL, 0, kSCSIDataTransfer_NoDataTransfer, 60000);
+    /* A 200-disc carousel can take several minutes to inventory. */
+    return execute_cdb(handle, cdb, sizeof(cdb), NULL, 0,
+                       kSCSIDataTransfer_NoDataTransfer, 600000);
 }
 
 static const char *element_type_name(uint8_t type) {
@@ -1886,17 +2116,163 @@ static int read_element_status_info(ChangerHandle *handle, uint16_t drive_addr, 
 
 static int cmd_move_medium(ChangerHandle *handle, uint16_t transport, uint16_t source, uint16_t dest) {
     uint8_t cdb[12] = {0};
-    cdb[0] = 0xA5; // MOVE MEDIUM
-    cdb[2] = (transport >> 8) & 0xFF;
-    cdb[3] = transport & 0xFF;
-    cdb[4] = (source >> 8) & 0xFF;
-    cdb[5] = source & 0xFF;
-    cdb[6] = (dest >> 8) & 0xFF;
-    cdb[7] = dest & 0xFF;
-    return execute_cdb(handle, cdb, sizeof(cdb), NULL, 0, kSCSIDataTransfer_NoDataTransfer, 60000);
+    if (build_move_medium_cdb(transport, source, dest, cdb) != MCHANGER_OK) {
+        return 1;
+    }
+
+    /*
+     * Some FireWire bridges return CHECK CONDITION with no auto-sense data
+     * while the changer is waking up.  Blindly replaying MOVE MEDIUM is not
+     * safe: the first command may have completed even though its status was
+     * lost.  After any failure, read both element descriptors first. A
+     * completed move is success even when the device reports SOURCE EMPTY;
+     * only a transient failure with a provably unchanged source/destination is
+     * safe to retry. Any ambiguous state is returned to the caller unchanged.
+     */
+    const int max_attempts = 3;
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        int rc = execute_cdb(handle, cdb, sizeof(cdb), NULL, 0,
+                             kSCSIDataTransfer_NoDataTransfer, 60000);
+        if (rc == 0) return 0;
+
+        bool transient_failure = g_last_command_transient;
+        bool operator_timeout = g_last_sense_key == kSENSE_KEY_UNIT_ATTENTION
+            && g_last_sense_asc == 0x53
+            && g_last_sense_ascq == 0x00;
+
+        ElementStatus source_status = {0}, dest_status = {0};
+        bool observed_unchanged = false;
+        for (int check = 0; check < 10; check++) {
+            if (check > 0) usleep(500000);
+            if (read_element_status_info(handle, source, &source_status,
+                                         dest, &dest_status) != 0) {
+                continue;
+            }
+
+            if (!source_status.full && dest_status.full) {
+                fprintf(stderr,
+                        "MOVE MEDIUM status was lost, but element inventory confirms completion.\n");
+                return 0;
+            }
+
+            if (source_status.full && !dest_status.full) {
+                if (operator_timeout) return MCHANGER_ERR_TIMEOUT;
+                observed_unchanged = true;
+                break;
+            }
+
+            fprintf(stderr,
+                    "MOVE MEDIUM failed with ambiguous element state; refusing to replay.\n");
+            return operator_timeout ? MCHANGER_ERR_TIMEOUT : rc;
+        }
+
+        if (!transient_failure) return operator_timeout ? MCHANGER_ERR_TIMEOUT : rc;
+        if (!observed_unchanged || attempt + 1 == max_attempts) {
+            return operator_timeout ? MCHANGER_ERR_TIMEOUT : rc;
+        }
+        fprintf(stderr,
+                "Transient MOVE MEDIUM failure; inventory is unchanged, retrying (%d/%d).\n",
+                attempt + 2, max_attempts);
+        usleep((useconds_t)(500000 * (attempt + 1)));
+    }
+
+    return 1;
+}
+
+static bool element_map_from_assignment(const ElementAddrAssignment *assign, ElementMap *map) {
+    if (!assign || !map || assign->num_transport == 0 ||
+        assign->num_storage == 0 || assign->num_drive == 0) {
+        return false;
+    }
+
+    for (uint16_t i = 0; i < assign->num_transport; i++) {
+        element_list_push(&map->transports, (uint16_t)(assign->first_transport + i));
+    }
+    for (uint16_t i = 0; i < assign->num_storage; i++) {
+        element_list_push(&map->slots, (uint16_t)(assign->first_storage + i));
+    }
+    for (uint16_t i = 0; i < assign->num_ie; i++) {
+        element_list_push(&map->ie, (uint16_t)(assign->first_ie + i));
+    }
+    for (uint16_t i = 0; i < assign->num_drive; i++) {
+        element_list_push(&map->drives, (uint16_t)(assign->first_drive + i));
+    }
+
+    return map->transports.count == assign->num_transport &&
+           map->slots.count == assign->num_storage &&
+           map->ie.count == assign->num_ie &&
+           map->drives.count == assign->num_drive;
+}
+
+static bool fetch_compact_element_map(ChangerHandle *handle, ElementMap *map) {
+    const uint32_t alloc = 4096;
+    uint8_t *buf = calloc(1, alloc);
+    if (!buf) return false;
+
+    uint8_t cdb[12] = {0};
+    cdb[0] = 0xB8; // READ ELEMENT STATUS
+    cdb[1] = 0x00; // all element types
+    cdb[4] = 0xFF;
+    cdb[5] = 0xFF;
+    cdb[6] = (alloc >> 16) & 0xFF;
+    cdb[7] = (alloc >> 8) & 0xFF;
+    cdb[8] = alloc & 0xFF;
+
+    int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc,
+                         kSCSIDataTransfer_FromTargetToInitiator, 30000);
+    if (rc != 0) {
+        free(buf);
+        return false;
+    }
+
+    uint32_t report_bytes = (buf[5] << 16) | (buf[6] << 8) | buf[7];
+    uint32_t parse_len = report_bytes + 8 < alloc ? report_bytes + 8 : alloc;
+    if (report_bytes > 0 && parse_len >= 8) {
+        (void)parse_element_status_map(buf, parse_len, map);
+    }
+    free(buf);
+
+    return map->transports.count > 0 && map->slots.count > 0 &&
+           map->drives.count > 0;
 }
 
 static int fetch_element_map(ChangerHandle *handle, ElementMap *map) {
+    /*
+     * Element addresses are static topology, not inventory. This Sony rejects
+     * MODE SENSE page 0x1D when it is the first command on a new FireWire
+     * session, but one 4 KiB all-elements status request wakes the bridge. Its
+     * response can be truncated (36 of 200 slots on the VGP-XL1B), so follow
+     * it with the tiny MODE SENSE topology request and prefer that complete
+     * static assignment. The compact map remains a fallback for devices that
+     * do not implement MODE SENSE page 0x1D.
+     */
+    bool compact_succeeded = fetch_compact_element_map(handle, map);
+
+    ElementAddrAssignment assignment = {0};
+    ElementMap assignment_map = {0};
+    if (read_mode_sense_element(handle, &assignment, false) == 0 &&
+        element_map_from_assignment(&assignment, &assignment_map)) {
+        element_map_free(map);
+        *map = assignment_map;
+        return 0;
+    }
+    element_map_free(&assignment_map);
+    if (compact_succeeded) return 0;
+    element_map_free(map);
+
+    /*
+     * The legacy discovery below sends one 64 KiB all-elements request plus
+     * as many as five more 64 KiB storage pages. On the Sony FireWire bridge,
+     * retrying those requests after a compact-read failure can strand the
+     * Catalina SBP-2 driver until the device is physically re-enumerated.
+     * Keep the path available for explicit library qualification on other
+     * changers, but never enter it automatically in the app.
+     */
+    const char *allow_legacy = getenv("MCHANGER_ALLOW_LEGACY_LARGE_MAP");
+    if (!allow_legacy || strcmp(allow_legacy, "1") != 0) {
+        return 1;
+    }
+
     uint32_t alloc = 65535;
     uint8_t *buf = calloc(1, alloc);
     if (!buf) return 1;
@@ -2091,6 +2467,16 @@ static bool confirm_move(void) {
     return (strncmp(buf, "yes", 3) == 0);
 }
 
+static bool confirm_gate_probe(void) {
+    fprintf(stderr,
+            "EXPERIMENTAL: this will submit one SMC-3 gate-open command.\n"
+            "Keep the import/export opening clear and watch the changer.\n"
+            "Type 'open-ie' to proceed: ");
+    char buf[32] = {0};
+    if (!fgets(buf, sizeof(buf), stdin)) return false;
+    return strcmp(buf, "open-ie\n") == 0 || strcmp(buf, "open-ie\r\n") == 0;
+}
+
 /*
  * =============================================================================
  * CLI Main (excluded when building as library with -DMCHANGER_NO_MAIN)
@@ -2204,6 +2590,56 @@ int main(int argc, char **argv) {
         rc = cmd_probe_storage(&handle);
     } else if (strcmp(argv[1], "init-status") == 0) {
         rc = cmd_init_status(&handle);
+    } else if (strcmp(argv[1], "probe-open-ie") == 0) {
+        size_t ie_index = 1;
+        bool have_ie = false;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--ie") == 0 && i + 1 < argc) {
+                have_ie = parse_index(argv[++i], &ie_index);
+            }
+        }
+        if (!have_ie) {
+            fprintf(stderr, "Missing or invalid --ie.\n");
+            rc = 1; goto out;
+        }
+        if (!confirm) {
+            fprintf(stderr,
+                    "Refusing experimental gate command without --confirm.\n");
+            rc = 1; goto out;
+        }
+
+        ElementMap map = {0};
+        rc = fetch_element_map(&handle, &map);
+        if (rc != 0 || ie_index > map.ie.count) {
+            fprintf(stderr, "I/E element %zu is unavailable (reported: %zu).\n",
+                    ie_index, map.ie.count);
+            element_map_free(&map);
+            rc = 1; goto out;
+        }
+        uint16_t ie_addr = map.ie.addrs[ie_index - 1];
+        uint8_t cdb[6] = {0};
+        (void)build_open_close_ie_cdb(ie_addr, true, cdb);
+        printf("OPEN I/E probe: index=%zu address=0x%04x CDB=", ie_index, ie_addr);
+        for (size_t i = 0; i < sizeof(cdb); i++) printf("%s%02x", i ? " " : "", cdb[i]);
+        printf("\n");
+        element_map_free(&map);
+
+        if (dry_run) {
+            printf("DRY RUN: command was not submitted.\n");
+        } else if (!confirm_gate_probe()) {
+            fprintf(stderr, "Aborted.\n");
+            rc = 1;
+        } else {
+            /* Deliberately bypass all retry helpers: opcode 0x1B is submitted
+               exactly once even if the bridge reports a transient failure. */
+            rc = execute_cdb(&handle, cdb, sizeof(cdb), NULL, 0,
+                             kSCSIDataTransfer_NoDataTransfer, 10000);
+            if (rc == 0) {
+                printf("OPEN I/E probe accepted by the changer.\n");
+            } else {
+                fprintf(stderr, "OPEN I/E probe was rejected or failed.\n");
+            }
+        }
     } else if (strcmp(argv[1], "read-element-status") == 0) {
         uint8_t element_type = 0;
         uint16_t start = 0;
@@ -2684,12 +3120,23 @@ int main(int argc, char **argv) {
         uint16_t slot_addr = map.slots.addrs[slot_index - 1];
         uint16_t ie_addr = map.ie.addrs[0];
 
-        printf("INSERT: IE(0x%04x) -> slot %zu(0x%04x)\n", ie_addr, slot_index, slot_addr);
-        printf("Place a disc in the IE port, then press Enter to continue...\n");
-        if (!dry_run) {
-            int c;
-            while ((c = getchar()) != '\n' && c != EOF);
+        ElementStatus ie_status = {0}, slot_status = {0};
+        if (read_element_status_info(&handle, ie_addr, &ie_status,
+                                     slot_addr, &slot_status) != 0) {
+            fprintf(stderr, "Could not verify the gate and destination slot.\n");
+            rc = 1;
+            element_map_free(&map);
+            goto out;
         }
+        if (slot_status.full) {
+            fprintf(stderr, "Slot %zu is already occupied; refusing to import.\n",
+                    slot_index);
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+
+        printf("INSERT: IE(0x%04x) -> slot %zu(0x%04x)\n", ie_addr, slot_index, slot_addr);
 
         if (dry_run) {
             printf("DRY RUN: MOVE transport=0x%04x source=0x%04x dest=0x%04x\n",
@@ -2700,6 +3147,12 @@ int main(int argc, char **argv) {
                 rc = 1;
                 element_map_free(&map);
                 goto out;
+            }
+            if (ie_status.full) {
+                printf("A disc is already present at the gate; accepting it now.\n");
+            } else {
+                printf("The gate should open now. Insert one disc when it does...\n");
+                fflush(stdout);
             }
             rc = cmd_move_medium(&handle, transport, ie_addr, slot_addr);
             if (rc == 0) {
@@ -2754,6 +3207,28 @@ int main(int argc, char **argv) {
         }
         uint16_t slot_addr = map.slots.addrs[slot_index - 1];
         uint16_t ie_addr = map.ie.addrs[0];
+
+        ElementStatus ie_status = {0}, slot_status = {0};
+        if (read_element_status_info(&handle, ie_addr, &ie_status,
+                                     slot_addr, &slot_status) != 0) {
+            fprintf(stderr, "Could not verify the source slot and gate.\n");
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+        if (!slot_status.full) {
+            fprintf(stderr, "Slot %zu is empty; there is nothing to retrieve.\n",
+                    slot_index);
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
+        if (ie_status.full) {
+            fprintf(stderr, "The gate already contains a disc; remove it first.\n");
+            rc = 1;
+            element_map_free(&map);
+            goto out;
+        }
 
         printf("RETRIEVE: slot %zu(0x%04x) -> IE(0x%04x)\n", slot_index, slot_addr, ie_addr);
 
@@ -2822,7 +3297,60 @@ out:
 /* Internal handle is compatible with public handle */
 struct MChangerHandle {
     ChangerHandle internal;
+    char registry_vendor[64];
+    char registry_product[64];
+    ElementMap element_cache;
+    bool element_cache_valid;
+    MChangerElementStatus *slot_status_cache;
+    MChangerElementStatus drive_status_cache;
+    bool drive_status_supported;
+    bool status_cache_valid;
+    CFAbsoluteTime status_cache_time;
 };
+
+static int ensure_element_cache(MChangerHandle *changer) {
+    if (changer->element_cache_valid) return MCHANGER_OK;
+    element_map_free(&changer->element_cache);
+    if (fetch_element_map(&changer->internal, &changer->element_cache) != 0) {
+        return MCHANGER_ERR_SCSI;
+    }
+    changer->element_cache_valid = true;
+    return MCHANGER_OK;
+}
+
+static int refresh_status_cache(MChangerHandle *changer) {
+    if (ensure_element_cache(changer) != MCHANGER_OK) return MCHANGER_ERR_SCSI;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (changer->status_cache_valid && now - changer->status_cache_time < 1.0) {
+        return MCHANGER_OK;
+    }
+
+    size_t slot_count = changer->element_cache.slots.count;
+    if (slot_count == 0 || changer->element_cache.drives.count == 0) {
+        return MCHANGER_ERR_SCSI;
+    }
+    MChangerElementStatus *slots = realloc(
+        changer->slot_status_cache, slot_count * sizeof(*slots));
+    if (!slots) return MCHANGER_ERR_INVALID;
+    changer->slot_status_cache = slots;
+
+    int rc = mchanger_get_bulk_status(
+        changer,
+        changer->element_cache.slots.addrs,
+        slot_count,
+        changer->element_cache.drives.addrs[0],
+        &changer->drive_status_cache,
+        changer->slot_status_cache,
+        &changer->drive_status_supported);
+    if (rc != MCHANGER_OK) {
+        changer->status_cache_valid = false;
+        return rc;
+    }
+    changer->status_cache_valid = true;
+    changer->status_cache_time = now;
+    return MCHANGER_OK;
+}
 
 /* List available changer devices */
 int mchanger_list_changers(MChangerHandleInfo **out_list, size_t *out_count) {
@@ -2832,10 +3360,14 @@ int mchanger_list_changers(MChangerHandleInfo **out_list, size_t *out_count) {
     *out_count = 0;
 
     io_iterator_t iter = match_scsi_devices();
-    if (iter == IO_OBJECT_NULL) return MCHANGER_ERR_NOT_FOUND;
+    /* A completed search with no matching IOKit class is an empty result,
+       not a library failure. This is especially important on macOS releases
+       where the FireWire stack is no longer present. */
+    if (iter == IO_OBJECT_NULL) return MCHANGER_OK;
 
-    /* Count changers first */
+    /* Count changer nubs first. */
     size_t count = 0;
+    bool using_sbp2_luns = false;
     io_service_t service;
     while ((service = IOIteratorNext(iter))) {
         if (is_changer_device(service)) count++;
@@ -2844,7 +3376,17 @@ int mchanger_list_changers(MChangerHandleInfo **out_list, size_t *out_count) {
 
     if (count == 0) {
         IOObjectRelease(iter);
-        return MCHANGER_OK; /* No changers found, but not an error */
+        iter = match_sbp2_luns();
+        if (iter == IO_OBJECT_NULL) return MCHANGER_OK;
+        using_sbp2_luns = true;
+        while ((service = IOIteratorNext(iter))) {
+            if (is_changer_device(service)) count++;
+            IOObjectRelease(service);
+        }
+        if (count == 0) {
+            IOObjectRelease(iter);
+            return MCHANGER_OK; /* No changers found, but not an error */
+        }
     }
 
     /* Allocate and fill */
@@ -2858,8 +3400,17 @@ int mchanger_list_changers(MChangerHandleInfo **out_list, size_t *out_count) {
     size_t idx = 0;
     while ((service = IOIteratorNext(iter)) && idx < count) {
         if (is_changer_device(service)) {
-            get_vendor_product(service, list[idx].vendor, sizeof(list[idx].vendor),
-                              list[idx].product, sizeof(list[idx].product));
+            if (using_sbp2_luns) {
+                CFTypeRef vendor = IORegistryEntryCreateCFProperty(
+                    service, CFSTR("FireWire Vendor Name"), kCFAllocatorDefault, 0);
+                cfstring_to_c(vendor, list[idx].vendor, sizeof(list[idx].vendor));
+                if (vendor) CFRelease(vendor);
+                snprintf(list[idx].product, sizeof(list[idx].product),
+                         "SBP-2 media changer");
+            } else {
+                get_vendor_product(service, list[idx].vendor, sizeof(list[idx].vendor),
+                                   list[idx].product, sizeof(list[idx].product));
+            }
             io_string_t path;
             if (IORegistryEntryGetPath(service, kIOServicePlane, path) == KERN_SUCCESS) {
                 strncpy(list[idx].path, path, sizeof(list[idx].path) - 1);
@@ -2886,6 +3437,7 @@ MChangerHandle *mchanger_open(const char *device_name) {
 
 MChangerHandle *mchanger_open_ex(const char *device_name, bool force, bool skip_tur) {
     (void)device_name; /* TODO: support opening specific device by name */
+    g_last_connect_error = MCHANGER_CONNECT_ERROR_NONE;
 
     MChangerHandle *changer = calloc(1, sizeof(MChangerHandle));
     if (!changer) return NULL;
@@ -2896,8 +3448,17 @@ MChangerHandle *mchanger_open_ex(const char *device_name, bool force, bool skip_
         return NULL;
     }
 
+    get_vendor_product(changer->internal.service,
+                       changer->registry_vendor, sizeof(changer->registry_vendor),
+                       changer->registry_product, sizeof(changer->registry_product));
+
     if (!skip_tur && !force) {
         if (cmd_test_unit_ready(&changer->internal) != 0) {
+            if (g_last_connect_error == MCHANGER_CONNECT_ERROR_NONE) {
+                g_last_connect_error = g_last_command_not_responding
+                    ? MCHANGER_CONNECT_ERROR_NOT_RESPONDING
+                    : MCHANGER_CONNECT_ERROR_OPEN_FAILED;
+            }
             close_changer(&changer->internal);
             free(changer);
             return NULL;
@@ -2907,9 +3468,36 @@ MChangerHandle *mchanger_open_ex(const char *device_name, bool force, bool skip_
     return changer;
 }
 
+int mchanger_last_connect_error(void) {
+    return g_last_connect_error;
+}
+
+bool mchanger_last_command_was_not_responding(void) {
+    return g_last_command_not_responding;
+}
+
+int mchanger_get_registry_identity(MChangerHandle *changer,
+                                   char *vendor, size_t vendor_len,
+                                   char *product, size_t product_len,
+                                   char *revision, size_t revision_len) {
+    if (!changer) return MCHANGER_ERR_INVALID;
+    if (vendor && vendor_len > 0) {
+        snprintf(vendor, vendor_len, "%s", changer->registry_vendor);
+    }
+    if (product && product_len > 0) {
+        snprintf(product, product_len, "%s", changer->registry_product);
+    }
+    if (revision && revision_len > 0) {
+        revision[0] = '\0';
+    }
+    return MCHANGER_OK;
+}
+
 void mchanger_close(MChangerHandle *changer) {
     if (!changer) return;
     close_changer(&changer->internal);
+    element_map_free(&changer->element_cache);
+    free(changer->slot_status_cache);
     free(changer);
 }
 
@@ -2919,48 +3507,46 @@ int mchanger_get_element_map(MChangerHandle *changer, MChangerElementMap *out_ma
 
     memset(out_map, 0, sizeof(*out_map));
 
-    ElementMap internal_map = {0};
-    int rc = fetch_element_map(&changer->internal, &internal_map);
-    if (rc != 0) return MCHANGER_ERR_SCSI;
+    int rc = ensure_element_cache(changer);
+    if (rc != MCHANGER_OK) return rc;
+    ElementMap *internal_map = &changer->element_cache;
 
     /* Copy to public structure */
-    if (internal_map.slots.count > 0) {
-        out_map->slot_addrs = malloc(internal_map.slots.count * sizeof(uint16_t));
+    if (internal_map->slots.count > 0) {
+        out_map->slot_addrs = malloc(internal_map->slots.count * sizeof(uint16_t));
         if (out_map->slot_addrs) {
-            memcpy(out_map->slot_addrs, internal_map.slots.addrs,
-                   internal_map.slots.count * sizeof(uint16_t));
-            out_map->slot_count = internal_map.slots.count;
+            memcpy(out_map->slot_addrs, internal_map->slots.addrs,
+                   internal_map->slots.count * sizeof(uint16_t));
+            out_map->slot_count = internal_map->slots.count;
         }
     }
 
-    if (internal_map.drives.count > 0) {
-        out_map->drive_addrs = malloc(internal_map.drives.count * sizeof(uint16_t));
+    if (internal_map->drives.count > 0) {
+        out_map->drive_addrs = malloc(internal_map->drives.count * sizeof(uint16_t));
         if (out_map->drive_addrs) {
-            memcpy(out_map->drive_addrs, internal_map.drives.addrs,
-                   internal_map.drives.count * sizeof(uint16_t));
-            out_map->drive_count = internal_map.drives.count;
+            memcpy(out_map->drive_addrs, internal_map->drives.addrs,
+                   internal_map->drives.count * sizeof(uint16_t));
+            out_map->drive_count = internal_map->drives.count;
         }
     }
 
-    if (internal_map.transports.count > 0) {
-        out_map->transport_addrs = malloc(internal_map.transports.count * sizeof(uint16_t));
+    if (internal_map->transports.count > 0) {
+        out_map->transport_addrs = malloc(internal_map->transports.count * sizeof(uint16_t));
         if (out_map->transport_addrs) {
-            memcpy(out_map->transport_addrs, internal_map.transports.addrs,
-                   internal_map.transports.count * sizeof(uint16_t));
-            out_map->transport_count = internal_map.transports.count;
+            memcpy(out_map->transport_addrs, internal_map->transports.addrs,
+                   internal_map->transports.count * sizeof(uint16_t));
+            out_map->transport_count = internal_map->transports.count;
         }
     }
 
-    if (internal_map.ie.count > 0) {
-        out_map->ie_addrs = malloc(internal_map.ie.count * sizeof(uint16_t));
+    if (internal_map->ie.count > 0) {
+        out_map->ie_addrs = malloc(internal_map->ie.count * sizeof(uint16_t));
         if (out_map->ie_addrs) {
-            memcpy(out_map->ie_addrs, internal_map.ie.addrs,
-                   internal_map.ie.count * sizeof(uint16_t));
-            out_map->ie_count = internal_map.ie.count;
+            memcpy(out_map->ie_addrs, internal_map->ie.addrs,
+                   internal_map->ie.count * sizeof(uint16_t));
+            out_map->ie_count = internal_map->ie.count;
         }
     }
-
-    element_map_free(&internal_map);
     return MCHANGER_OK;
 }
 
@@ -2977,57 +3563,25 @@ void mchanger_free_element_map(MChangerElementMap *map) {
 int mchanger_get_slot_status(MChangerHandle *changer, int slot, MChangerElementStatus *out_status) {
     if (!changer || !out_status || slot < 1) return MCHANGER_ERR_INVALID;
 
-    ElementMap map = {0};
-    if (fetch_element_map(&changer->internal, &map) != 0) return MCHANGER_ERR_SCSI;
-
-    if ((size_t)slot > map.slots.count) {
-        element_map_free(&map);
+    int rc = refresh_status_cache(changer);
+    if (rc != MCHANGER_OK) return rc;
+    if ((size_t)slot > changer->element_cache.slots.count) {
         return MCHANGER_ERR_INVALID;
     }
-
-    uint16_t slot_addr = map.slots.addrs[slot - 1];
-    uint16_t drive_addr = map.drives.count > 0 ? map.drives.addrs[0] : 0;
-
-    ElementStatus internal_st = {0};
-    int rc = read_element_status_info(&changer->internal, drive_addr, NULL, slot_addr, &internal_st);
-    element_map_free(&map);
-
-    if (rc != 0) return MCHANGER_ERR_SCSI;
-
-    out_status->address = internal_st.addr;
-    out_status->full = internal_st.full;
-    out_status->except = false; /* TODO: extract from flags */
-    out_status->valid_source = internal_st.valid_src;
-    out_status->source_addr = internal_st.src_addr;
-
+    *out_status = changer->slot_status_cache[slot - 1];
     return MCHANGER_OK;
 }
 
 int mchanger_get_drive_status(MChangerHandle *changer, int drive, MChangerElementStatus *out_status) {
     if (!changer || !out_status || drive < 1) return MCHANGER_ERR_INVALID;
 
-    ElementMap map = {0};
-    if (fetch_element_map(&changer->internal, &map) != 0) return MCHANGER_ERR_SCSI;
-
-    if ((size_t)drive > map.drives.count) {
-        element_map_free(&map);
+    int rc = refresh_status_cache(changer);
+    if (rc != MCHANGER_OK) return rc;
+    if ((size_t)drive > changer->element_cache.drives.count || drive != 1 ||
+        !changer->drive_status_supported) {
         return MCHANGER_ERR_INVALID;
     }
-
-    uint16_t drive_addr = map.drives.addrs[drive - 1];
-
-    ElementStatus internal_st = {0};
-    int rc = read_element_status_info(&changer->internal, drive_addr, &internal_st, 0, NULL);
-    element_map_free(&map);
-
-    if (rc != 0) return MCHANGER_ERR_SCSI;
-
-    out_status->address = internal_st.addr;
-    out_status->full = internal_st.full;
-    out_status->except = false;
-    out_status->valid_source = internal_st.valid_src;
-    out_status->source_addr = internal_st.src_addr;
-
+    *out_status = changer->drive_status_cache;
     return MCHANGER_OK;
 }
 
@@ -3169,6 +3723,103 @@ int mchanger_get_bulk_status(MChangerHandle *changer,
     return MCHANGER_OK;
 }
 
+int mchanger_initialize_element_status(MChangerHandle *changer) {
+    if (!changer) return MCHANGER_ERR_INVALID;
+
+    int rc = cmd_init_status(&changer->internal);
+    changer->status_cache_valid = false;
+    if (rc != 0) return MCHANGER_ERR_SCSI;
+
+    /* The element addresses normally remain stable, but firmware is allowed
+       to rebuild the reported map as part of initialization. */
+    element_map_free(&changer->element_cache);
+    changer->element_cache_valid = false;
+    changer->drive_status_supported = false;
+    return MCHANGER_OK;
+}
+
+int mchanger_set_import_export_access(MChangerHandle *changer, int ie,
+                                      bool open) {
+    if (!changer || ie < 1) return MCHANGER_ERR_INVALID;
+
+    int rc = ensure_element_cache(changer);
+    if (rc != MCHANGER_OK) return rc;
+    if ((size_t)ie > changer->element_cache.ie.count) {
+        return MCHANGER_ERR_INVALID;
+    }
+
+    uint8_t cdb[6] = {0};
+    build_open_close_ie_cdb(changer->element_cache.ie.addrs[ie - 1], open,
+                            cdb);
+    /* OPEN/CLOSE is state-changing and must never be automatically replayed.
+       cdb_is_retryable() intentionally excludes opcode 0x1B. */
+    rc = execute_cdb(&changer->internal, cdb, sizeof(cdb), NULL, 0,
+                     kSCSIDataTransfer_NoDataTransfer, 10000);
+    changer->status_cache_valid = false;
+    if (rc == 0) return MCHANGER_OK;
+    return MCHANGER_ERR_SCSI;
+}
+
+int mchanger_import_slot(MChangerHandle *changer, int slot) {
+    if (!changer || slot < 1) return MCHANGER_ERR_INVALID;
+
+    int rc = ensure_element_cache(changer);
+    if (rc != MCHANGER_OK) return rc;
+    ElementMap *map = &changer->element_cache;
+    if ((size_t)slot > map->slots.count || map->ie.count == 0 ||
+        map->transports.count == 0) {
+        return MCHANGER_ERR_INVALID;
+    }
+
+    uint16_t ie_addr = map->ie.addrs[0];
+    uint16_t slot_addr = map->slots.addrs[slot - 1];
+    ElementStatus ie_status = {0}, slot_status = {0};
+    if (read_element_status_info(&changer->internal, ie_addr, &ie_status,
+                                 slot_addr, &slot_status) != 0) {
+        return MCHANGER_ERR_SCSI;
+    }
+    if (slot_status.full) return MCHANGER_ERR_BUSY;
+
+    /* PowerFile's documented software-load sequence intentionally starts with
+       an empty I/E element. MOVE MEDIUM opens the gate and waits for the user
+       to insert a disc before completing the move into the storage slot. */
+    rc = cmd_move_medium(&changer->internal, map->transports.addrs[0],
+                         ie_addr, slot_addr);
+    changer->status_cache_valid = false;
+    if (rc == 0) return MCHANGER_OK;
+    if (rc == MCHANGER_ERR_TIMEOUT) return MCHANGER_ERR_TIMEOUT;
+    return MCHANGER_ERR_SCSI;
+}
+
+int mchanger_export_slot(MChangerHandle *changer, int slot) {
+    if (!changer || slot < 1) return MCHANGER_ERR_INVALID;
+
+    int rc = ensure_element_cache(changer);
+    if (rc != MCHANGER_OK) return rc;
+    ElementMap *map = &changer->element_cache;
+    if ((size_t)slot > map->slots.count || map->ie.count == 0 ||
+        map->transports.count == 0) {
+        return MCHANGER_ERR_INVALID;
+    }
+
+    uint16_t ie_addr = map->ie.addrs[0];
+    uint16_t slot_addr = map->slots.addrs[slot - 1];
+    ElementStatus ie_status = {0}, slot_status = {0};
+    if (read_element_status_info(&changer->internal, ie_addr, &ie_status,
+                                 slot_addr, &slot_status) != 0) {
+        return MCHANGER_ERR_SCSI;
+    }
+    if (!slot_status.full) return MCHANGER_ERR_EMPTY;
+    if (ie_status.full) return MCHANGER_ERR_BUSY;
+
+    rc = cmd_move_medium(&changer->internal, map->transports.addrs[0],
+                         slot_addr, ie_addr);
+    changer->status_cache_valid = false;
+    if (rc == 0) return MCHANGER_OK;
+    if (rc == MCHANGER_ERR_TIMEOUT) return MCHANGER_ERR_TIMEOUT;
+    return MCHANGER_ERR_SCSI;
+}
+
 /* Load a disc from slot into drive */
 int mchanger_load_slot(MChangerHandle *changer, int slot, int drive) {
     return mchanger_load_slot_verbose(changer, slot, drive, NULL, NULL);
@@ -3203,6 +3854,18 @@ int mchanger_load_slot_verbose(MChangerHandle *changer, int slot, int drive,
         return MCHANGER_OK;
     }
 
+    /* This Sony firmware can retain a drive FULL bit after a verified return,
+       while dropping SVALID. If the requested source slot is itself full,
+       treating that untraceable drive bit as authoritative prevents every
+       future load. Do not attempt an unsafe drive-to-occupied-slot move here;
+       proceed with slot-to-drive instead. A genuinely occupied drive will
+       reject the destination-full move without changing either element. */
+    if (drive_st.full && !drive_st.valid_src && slot_st.full) {
+        fprintf(stderr,
+                "Ignoring untraceable drive-full bit while source slot is full.\n");
+        drive_st.full = false;
+    }
+
     /* Slot empty and disc not in drive? */
     if (!slot_st.full && !(drive_st.full && drive_st.valid_src && drive_st.src_addr == slot_addr)) {
         element_map_free(&map);
@@ -3214,7 +3877,6 @@ int mchanger_load_slot_verbose(MChangerHandle *changer, int slot, int drive,
     /* If drive has a different disc, unload it first */
     if (drive_st.full) {
         uint16_t unload_addr = drive_st.valid_src ? drive_st.src_addr : slot_addr;
-        eject_optical_media();
         rc = cmd_move_medium(&changer->internal, transport, drive_addr, unload_addr);
         if (rc != 0) {
             element_map_free(&map);
@@ -3227,6 +3889,7 @@ int mchanger_load_slot_verbose(MChangerHandle *changer, int slot, int drive,
     element_map_free(&map);
 
     if (rc != 0) return MCHANGER_ERR_SCSI;
+    changer->status_cache_valid = false;
 
     /* Notify about mounted disc if callback provided */
     if (callback) {
@@ -3238,7 +3901,13 @@ int mchanger_load_slot_verbose(MChangerHandle *changer, int slot, int drive,
     return MCHANGER_OK;
 }
 
-/* Unload the drive to a specific slot */
+/* Unload the drive to a specific slot.
+ *
+ * This function deliberately performs changer robotics only. The caller owns
+ * any operating-system mount and optical-device release for the exact drive it
+ * selected. Hiding a system-wide `diskutil eject` here races that release and
+ * can leave the Sony FireWire control LUN unable to accept MOVE MEDIUM.
+ */
 int mchanger_unload_drive(MChangerHandle *changer, int slot, int drive) {
     if (!changer || slot < 1 || drive < 1) return MCHANGER_ERR_INVALID;
 
@@ -3254,9 +3923,10 @@ int mchanger_unload_drive(MChangerHandle *changer, int slot, int drive) {
     uint16_t slot_addr = map.slots.addrs[slot - 1];
     uint16_t drive_addr = map.drives.addrs[drive - 1];
 
-    eject_optical_media();
     int rc = cmd_move_medium(&changer->internal, transport, drive_addr, slot_addr);
     element_map_free(&map);
+
+    if (rc == 0) changer->status_cache_valid = false;
 
     return rc == 0 ? MCHANGER_OK : MCHANGER_ERR_SCSI;
 }
@@ -3289,7 +3959,6 @@ int mchanger_eject(MChangerHandle *changer, int slot, int drive) {
 
     /* If disc is in drive, unload to slot first */
     if (!slot_st.full && drive_st.full) {
-        eject_optical_media();
         rc = cmd_move_medium(&changer->internal, transport, drive_addr, slot_addr);
         if (rc != 0) {
             element_map_free(&map);
@@ -3301,13 +3970,17 @@ int mchanger_eject(MChangerHandle *changer, int slot, int drive) {
     rc = cmd_move_medium(&changer->internal, transport, slot_addr, ie_addr);
     element_map_free(&map);
 
+    if (rc == 0) changer->status_cache_valid = false;
+
     return rc == 0 ? MCHANGER_OK : MCHANGER_ERR_SCSI;
 }
 
 /* Low-level move medium */
 int mchanger_move_medium(MChangerHandle *changer, uint16_t transport, uint16_t source, uint16_t dest) {
     if (!changer) return MCHANGER_ERR_INVALID;
-    return cmd_move_medium(&changer->internal, transport, source, dest) == 0 ? MCHANGER_OK : MCHANGER_ERR_SCSI;
+    int rc = cmd_move_medium(&changer->internal, transport, source, dest);
+    if (rc == 0) changer->status_cache_valid = false;
+    return rc == 0 ? MCHANGER_OK : MCHANGER_ERR_SCSI;
 }
 
 /* Eject from macOS */

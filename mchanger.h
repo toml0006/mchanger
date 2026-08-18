@@ -59,6 +59,14 @@ typedef void (*MChangerMountCallback)(const char *name, const char *size, void *
 #define MCHANGER_ERR_INVALID    -4
 #define MCHANGER_ERR_BUSY       -5
 #define MCHANGER_ERR_EMPTY      -6
+#define MCHANGER_ERR_TIMEOUT    -7
+
+/* Classified reason for the most recent failed mchanger_open() call. */
+#define MCHANGER_CONNECT_ERROR_NONE               0
+#define MCHANGER_CONNECT_ERROR_NOT_FOUND          1
+#define MCHANGER_CONNECT_ERROR_OWNED_ELSEWHERE    2
+#define MCHANGER_CONNECT_ERROR_NOT_RESPONDING     3
+#define MCHANGER_CONNECT_ERROR_OPEN_FAILED        4
 
 /*
  * Discovery
@@ -79,6 +87,21 @@ MChangerHandle *mchanger_open(const char *device_name);
 
 /* Open with additional options */
 MChangerHandle *mchanger_open_ex(const char *device_name, bool force, bool skip_tur);
+
+/* Returns one of MCHANGER_CONNECT_ERROR_* after mchanger_open() returns NULL. */
+int mchanger_last_connect_error(void);
+
+/* True when the most recent command exhausted retries without a usable response. */
+bool mchanger_last_command_was_not_responding(void);
+
+/*
+ * Return the device identity already published by IORegistry. Unlike
+ * mchanger_inquiry(), this does not send a SCSI command to the changer.
+ */
+int mchanger_get_registry_identity(MChangerHandle *changer,
+                                   char *vendor, size_t vendor_len,
+                                   char *product, size_t product_len,
+                                   char *revision, size_t revision_len);
 
 /* Close a changer handle */
 void mchanger_close(MChangerHandle *changer);
@@ -122,20 +145,65 @@ int mchanger_get_bulk_status(MChangerHandle *changer,
                              bool *out_drive_supported);
 
 /*
+ * Ask the changer to physically rescan its element inventory. This is much
+ * slower than READ ELEMENT STATUS and is intended for recovery after a device
+ * reset or when the reported drive/slot state is stale.
+ */
+int mchanger_initialize_element_status(MChangerHandle *changer);
+
+/*
+ * Ask the changer to open or close one of its operator-accessible
+ * import/export elements (1-based index).
+ *
+ * This is the optional SMC-3 OPEN/CLOSE IMPORT/EXPORT ELEMENT command. Older
+ * changers may reject it with MCHANGER_ERR_SCSI. The command is submitted
+ * exactly once: it is never automatically replayed after a transport error.
+ */
+int mchanger_set_import_export_access(MChangerHandle *changer, int ie,
+                                      bool open);
+
+/*
+ * Accept one disc through the first import/export element and store it in the
+ * selected empty slot. On PowerFile/Sony changers, issuing this MOVE MEDIUM
+ * while the I/E element is empty opens the front gate and waits for insertion.
+ */
+int mchanger_import_slot(MChangerHandle *changer, int slot);
+
+/*
+ * Present one disc from the selected storage slot at the first import/export
+ * element for physical removal. The destination I/E element must be empty.
+ */
+int mchanger_export_slot(MChangerHandle *changer, int slot);
+
+/*
  * Operations
  */
 
-/* Load a disc from slot into drive. Automatically unloads any disc currently in drive. */
+/*
+ * Load a disc from slot into drive. If another disc is already in the drive,
+ * it is returned robotically; the caller must release that optical device
+ * from the operating system first.
+ */
 int mchanger_load_slot(MChangerHandle *changer, int slot, int drive);
 
 /* Load with verbose callback for mounted disc info */
 int mchanger_load_slot_verbose(MChangerHandle *changer, int slot, int drive,
                            MChangerMountCallback callback, void *context);
 
-/* Unload the drive to a specific slot */
+/*
+ * Unload the drive to a specific slot using changer robotics only.
+ *
+ * The caller must first unmount and release the matching optical device from
+ * the operating system. This function never discovers or ejects media on its
+ * own, so it cannot accidentally target another drive or duplicate a release.
+ */
 int mchanger_unload_drive(MChangerHandle *changer, int slot, int drive);
 
-/* Eject a disc to the import/export slot for physical removal */
+/*
+ * Eject a disc to the import/export slot using changer robotics only. If the
+ * disc is currently in the drive, the caller must release its optical device
+ * from the operating system first.
+ */
 int mchanger_eject(MChangerHandle *changer, int slot, int drive);
 
 /*
@@ -161,6 +229,18 @@ int mchanger_inquiry(MChangerHandle *changer, char *vendor, size_t vendor_len,
 
 /* Send TEST UNIT READY */
 int mchanger_test_unit_ready(MChangerHandle *changer);
+
+#ifdef MCHANGER_TESTING
+/* Pure command helpers exposed only to the software test build. */
+int mchanger_test_build_open_close_ie_cdb(uint16_t element_address,
+                                          bool open,
+                                          uint8_t out_cdb[6]);
+int mchanger_test_build_move_medium_cdb(uint16_t transport,
+                                        uint16_t source,
+                                        uint16_t dest,
+                                        uint8_t out_cdb[12]);
+bool mchanger_test_cdb_is_retryable(const uint8_t *cdb, uint8_t cdb_len);
+#endif
 
 #ifdef __cplusplus
 }
