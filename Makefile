@@ -3,7 +3,9 @@
 # Build targets:
 #   make          - Build the CLI tool
 #   make lib      - Build the static library
-#   make test     - Run library tests
+#   make test     - Run software tests; hardware tests skip if disconnected
+#   make qualification - Require a connected 200-slot changer (read-only)
+#   make motion-test SLOT=1 - Load and return one known occupied slot
 #   make clean    - Remove build artifacts
 
 CC = cc
@@ -23,15 +25,26 @@ libmchanger.a: mchanger.c mchanger.h
 	rm -f mchanger.o
 
 # Test binary
-test_mchanger: test_mchanger.c libmchanger.a mchanger.h
-	$(CC) $(CFLAGS) -o $@ test_mchanger.c -L. -lmchanger $(FRAMEWORKS)
+test_mchanger: test_mchanger.c mchanger.c mchanger.h
+	$(CC) $(CFLAGS) -DMCHANGER_NO_MAIN -DMCHANGER_TESTING -o $@ test_mchanger.c mchanger.c $(FRAMEWORKS)
 
 # Run tests
 test: test_mchanger
 	./test_mchanger
 
+# Read-only hardware qualification. Override EXPECTED_SLOTS for another model.
+EXPECTED_SLOTS ?= 200
+qualification: test_mchanger
+	./test_mchanger --require-hardware --expect-slots $(EXPECTED_SLOTS)
+
+# Explicitly opt in to moving one known occupied slot into drive 1 and back.
+motion-test: test_mchanger
+	@test -n "$(SLOT)" || (echo "Usage: make motion-test SLOT=<known-occupied-slot>" && exit 2)
+	./test_mchanger --require-hardware --expect-slots $(EXPECTED_SLOTS) --motion-slot $(SLOT)
+
 # Clean build artifacts
 clean:
 	rm -f mchanger mchanger.o libmchanger.a test_mchanger
+	rm -rf test_mchanger.dSYM
 
-.PHONY: lib test clean
+.PHONY: lib test qualification motion-test clean

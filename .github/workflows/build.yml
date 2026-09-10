@@ -18,6 +18,9 @@ jobs:
       - name: Build library
         run: make lib
 
+      - name: Run software tests
+        run: make test
+
       - name: Verify build artifacts
         run: |
           test -x mchanger
