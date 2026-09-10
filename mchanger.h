@@ -126,10 +126,14 @@ int mchanger_get_slot_status(MChangerHandle *changer, int slot, MChangerElementS
 /* Get status of a specific drive (1-based index) */
 int mchanger_get_drive_status(MChangerHandle *changer, int drive, MChangerElementStatus *out_status);
 
+/* Get status of a specific import/export element (1-based index). */
+int mchanger_get_ie_status(MChangerHandle *changer, int ie, MChangerElementStatus *out_status);
+
 /*
  * Bulk status
  *
- * Read element status once and fill the provided slot array (and optional drive status).
+ * Read element status, following paginated reports when required, and fill the
+ * provided slot array (and optional drive status).
  *
  * - slot_addrs/slot_count should come from a previously fetched element map.
  * - drive_addr should be an element address from the map (pass 0 to skip drive status).
@@ -239,6 +243,22 @@ int mchanger_test_build_move_medium_cdb(uint16_t transport,
                                         uint16_t source,
                                         uint16_t dest,
                                         uint8_t out_cdb[12]);
+int mchanger_test_build_read_element_status_cdb(uint8_t element_type,
+                                                uint16_t start,
+                                                uint16_t count,
+                                                uint32_t allocation_length,
+                                                uint8_t out_cdb[12]);
+int mchanger_test_parse_bulk_status_report(
+    const uint8_t *buffer,
+    size_t buffer_length,
+    uint16_t request_start,
+    const uint16_t *slot_addrs,
+    size_t slot_count,
+    uint16_t drive_addr,
+    MChangerElementStatus *out_drive,
+    MChangerElementStatus *out_slots,
+    bool *io_drive_supported,
+    uint16_t *out_next_start);
 bool mchanger_test_cdb_is_retryable(const uint8_t *cdb, uint8_t cdb_len);
 #endif
 

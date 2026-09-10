@@ -177,6 +177,9 @@ TEST(api_null_changer_returns_invalid) {
     ASSERT_EQ(mchanger_unload_drive(NULL, 1, 1), MCHANGER_ERR_INVALID, "unload_drive");
     ASSERT_EQ(mchanger_eject(NULL, 1, 1), MCHANGER_ERR_INVALID, "eject");
     ASSERT_EQ(mchanger_import_slot(NULL, 1), MCHANGER_ERR_INVALID, "import_slot");
+    MChangerElementStatus ie_status = {0};
+    ASSERT_EQ(mchanger_get_ie_status(NULL, 1, &ie_status), MCHANGER_ERR_INVALID,
+              "get_ie_status");
     ASSERT_EQ(mchanger_export_slot(NULL, 1), MCHANGER_ERR_INVALID, "export_slot");
     ASSERT_EQ(mchanger_move_medium(NULL, 0, 0, 0), MCHANGER_ERR_INVALID, "move_medium");
     ASSERT_EQ(mchanger_set_import_export_access(NULL, 1, true), MCHANGER_ERR_INVALID,
@@ -226,6 +229,109 @@ TEST(move_medium_cdb_layout) {
            "MOVE MEDIUM CDB does not match SMC layout");
     ASSERT_EQ(mchanger_test_build_move_medium_cdb(0, 0, 0, NULL),
               MCHANGER_ERR_INVALID, "NULL MOVE MEDIUM CDB output");
+    PASS();
+}
+
+TEST(read_element_status_cdb_layout) {
+    uint8_t cdb[12];
+    memset(cdb, 0xFF, sizeof(cdb));
+    ASSERT_EQ(mchanger_test_build_read_element_status_cdb(
+                  0x02, 0x1234, 0x00C8, 4096, cdb),
+              MCHANGER_OK, "build READ ELEMENT STATUS CDB");
+    const uint8_t expected[12] = {
+        0xB8, 0x02, 0x12, 0x34, 0x00, 0xC8,
+        0x00, 0x00, 0x10, 0x00, 0x00, 0x00
+    };
+    ASSERT(memcmp(cdb, expected, sizeof(cdb)) == 0,
+           "READ ELEMENT STATUS CDB does not match SMC layout");
+    ASSERT_EQ(mchanger_test_build_read_element_status_cdb(
+                  0, 0, 0, 0x1000000, cdb),
+              MCHANGER_ERR_INVALID, "reject oversized allocation length");
+    PASS();
+}
+
+static size_t append_status_page(uint8_t *buffer, size_t offset, uint8_t type,
+                                 const uint16_t *addresses,
+                                 const uint8_t *flags, size_t count) {
+    const uint16_t descriptor_length = 16;
+    size_t page_bytes = count * descriptor_length;
+    buffer[offset] = type;
+    buffer[offset + 2] = (uint8_t)(descriptor_length >> 8);
+    buffer[offset + 3] = (uint8_t)descriptor_length;
+    buffer[offset + 5] = (uint8_t)(page_bytes >> 16);
+    buffer[offset + 6] = (uint8_t)(page_bytes >> 8);
+    buffer[offset + 7] = (uint8_t)page_bytes;
+    offset += 8;
+    for (size_t i = 0; i < count; i++) {
+        buffer[offset] = (uint8_t)(addresses[i] >> 8);
+        buffer[offset + 1] = (uint8_t)addresses[i];
+        buffer[offset + 2] = flags[i];
+        offset += descriptor_length;
+    }
+    return offset;
+}
+
+static size_t finish_status_report(uint8_t *buffer, size_t length,
+                                   uint16_t element_count) {
+    size_t report_bytes = length - 8;
+    buffer[2] = (uint8_t)(element_count >> 8);
+    buffer[3] = (uint8_t)element_count;
+    buffer[5] = (uint8_t)(report_bytes >> 16);
+    buffer[6] = (uint8_t)(report_bytes >> 8);
+    buffer[7] = (uint8_t)report_bytes;
+    return length;
+}
+
+TEST(paginated_bulk_status_parser) {
+    const uint16_t slot_addresses[] = {4, 39, 40, 41};
+    MChangerElementStatus slots[4] = {
+        {.address = 4, .except = true},
+        {.address = 39, .except = true},
+        {.address = 40, .except = true},
+        {.address = 41, .except = true}
+    };
+    MChangerElementStatus drive = {.address = 2};
+    bool drive_supported = false;
+
+    uint8_t first[128] = {0};
+    size_t first_length = 8;
+    const uint16_t drive_address[] = {2};
+    const uint8_t drive_flags[] = {1};
+    first_length = append_status_page(first, first_length, 0x04,
+                                      drive_address, drive_flags, 1);
+    const uint16_t first_slots[] = {4, 39, 0};
+    const uint8_t first_flags[] = {1, 1, 0};
+    first_length = append_status_page(first, first_length, 0x02,
+                                      first_slots, first_flags, 3);
+    finish_status_report(first, first_length, 4);
+
+    uint16_t next = 0;
+    ASSERT_EQ(mchanger_test_parse_bulk_status_report(
+                  first, first_length, 0, slot_addresses, 4, 2,
+                  &drive, slots, &drive_supported, &next),
+              MCHANGER_OK, "parse first XL1B status chunk");
+    ASSERT_EQ(next, 40, "next request should start after the last real descriptor");
+    ASSERT(drive_supported && drive.full, "drive page should be retained");
+    ASSERT(slots[0].full && !slots[0].except, "slot 4 should be occupied");
+    ASSERT(slots[1].full && !slots[1].except, "slot 39 should be occupied");
+    ASSERT(slots[2].except && slots[3].except,
+           "unreported slots must remain unknown after the first chunk");
+
+    uint8_t second[96] = {0};
+    size_t second_length = 8;
+    const uint16_t second_slots[] = {40, 41};
+    const uint8_t second_flags[] = {0, 1};
+    second_length = append_status_page(second, second_length, 0x02,
+                                       second_slots, second_flags, 2);
+    finish_status_report(second, second_length, 2);
+
+    ASSERT_EQ(mchanger_test_parse_bulk_status_report(
+                  second, second_length, 40, slot_addresses, 4, 2,
+                  &drive, slots, &drive_supported, &next),
+              MCHANGER_OK, "parse second XL1B status chunk");
+    ASSERT_EQ(next, 42, "pagination should advance across the second chunk");
+    ASSERT(!slots[2].full && !slots[2].except, "slot 40 should be verified empty");
+    ASSERT(slots[3].full && !slots[3].except, "slot 41 should be occupied");
     PASS();
 }
 
@@ -521,6 +627,8 @@ int main(int argc, char **argv) {
     RUN_TEST(open_close_ie_cdb_layout);
     RUN_TEST(open_close_ie_is_never_retried);
     RUN_TEST(move_medium_cdb_layout);
+    RUN_TEST(read_element_status_cdb_layout);
+    RUN_TEST(paginated_bulk_status_parser);
     RUN_TEST(api_invalid_indices_return_invalid);
 
     printf("\nRead-only hardware qualification:\n");

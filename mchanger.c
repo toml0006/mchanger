@@ -1347,6 +1347,23 @@ static int build_move_medium_cdb(uint16_t transport, uint16_t source,
     return MCHANGER_OK;
 }
 
+static int build_read_element_status_cdb(uint8_t element_type, uint16_t start,
+                                         uint16_t count, uint32_t alloc,
+                                         uint8_t out_cdb[12]) {
+    if (!out_cdb || alloc > 0xFFFFFF) return MCHANGER_ERR_INVALID;
+    memset(out_cdb, 0, 12);
+    out_cdb[0] = 0xB8;
+    out_cdb[1] = element_type & 0x0F;
+    out_cdb[2] = (uint8_t)(start >> 8);
+    out_cdb[3] = (uint8_t)(start & 0xFF);
+    out_cdb[4] = (uint8_t)(count >> 8);
+    out_cdb[5] = (uint8_t)(count & 0xFF);
+    out_cdb[7] = (uint8_t)(alloc >> 16);
+    out_cdb[8] = (uint8_t)(alloc >> 8);
+    out_cdb[9] = (uint8_t)alloc;
+    return MCHANGER_OK;
+}
+
 #ifdef MCHANGER_TESTING
 int mchanger_test_build_open_close_ie_cdb(uint16_t element_address,
                                           bool open,
@@ -1359,6 +1376,15 @@ int mchanger_test_build_move_medium_cdb(uint16_t transport,
                                         uint16_t dest,
                                         uint8_t out_cdb[12]) {
     return build_move_medium_cdb(transport, source, dest, out_cdb);
+}
+
+int mchanger_test_build_read_element_status_cdb(uint8_t element_type,
+                                                uint16_t start,
+                                                uint16_t count,
+                                                uint32_t allocation_length,
+                                                uint8_t out_cdb[12]) {
+    return build_read_element_status_cdb(element_type, start, count,
+                                         allocation_length, out_cdb);
 }
 
 bool mchanger_test_cdb_is_retryable(const uint8_t *cdb, uint8_t cdb_len) {
@@ -1542,9 +1568,9 @@ static int cmd_probe_storage(ChangerHandle *handle) {
         cdb[3] = start & 0xFF;
         cdb[4] = (count >> 8) & 0xFF;
         cdb[5] = count & 0xFF;
-        cdb[6] = (alloc >> 16) & 0xFF;
-        cdb[7] = (alloc >> 8) & 0xFF;
-        cdb[8] = alloc & 0xFF;
+        cdb[7] = (alloc >> 16) & 0xFF;
+        cdb[8] = (alloc >> 8) & 0xFF;
+        cdb[9] = alloc & 0xFF;
 
         memset(buf, 0, alloc);
         rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 30000);
@@ -1730,18 +1756,8 @@ static bool parse_element_status_map(const uint8_t *buf, uint32_t len, ElementMa
 
 static int cmd_read_element_status(ChangerHandle *handle, uint8_t element_type, uint16_t start, uint16_t count, uint32_t alloc, bool dump_raw) {
     uint8_t cdb[12] = {0};
-    cdb[0] = 0xB8; // READ ELEMENT STATUS
-    cdb[1] = (element_type & 0x0F);
-    cdb[2] = (start >> 8) & 0xFF;
-    cdb[3] = start & 0xFF;
-    cdb[4] = (count >> 8) & 0xFF;
-    cdb[5] = count & 0xFF;
-    cdb[6] = (alloc >> 16) & 0xFF;
-    cdb[7] = (alloc >> 8) & 0xFF;
-    cdb[8] = alloc & 0xFF;
-    cdb[9] = 0;
-    cdb[10] = 0;
-    cdb[11] = 0;
+    if (build_read_element_status_cdb(element_type, start, count, alloc, cdb)
+        != MCHANGER_OK) return MCHANGER_ERR_INVALID;
 
     uint8_t *buf = calloc(1, alloc);
     if (!buf) {
@@ -1753,14 +1769,7 @@ static int cmd_read_element_status(ChangerHandle *handle, uint8_t element_type, 
     if (rc != 0 && element_type != 0x00) {
         fprintf(stderr, "READ ELEMENT STATUS failed for type '%s'; retrying with element-type=all.\n",
                 element_type_name(element_type));
-        memset(cdb, 0, sizeof(cdb));
-        cdb[0] = 0xB8; // READ ELEMENT STATUS
-        cdb[1] = 0x00; // all element types
-        cdb[4] = 0xFF;
-        cdb[5] = 0xFF;
-        cdb[6] = (alloc >> 16) & 0xFF;
-        cdb[7] = (alloc >> 8) & 0xFF;
-        cdb[8] = alloc & 0xFF;
+        (void)build_read_element_status_cdb(0x00, 0, 0xFFFF, alloc, cdb);
         memset(buf, 0, alloc);
         rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 30000);
     }
@@ -2030,13 +2039,7 @@ static int read_element_status_info(ChangerHandle *handle, uint16_t drive_addr, 
                                     uint16_t slot_addr, ElementStatus *slot_status) {
     uint32_t alloc = 4096;
     uint8_t cdb[12] = {0};
-    cdb[0] = 0xB8; // READ ELEMENT STATUS
-    cdb[1] = 0x00; // all element types
-    cdb[4] = 0xFF;
-    cdb[5] = 0xFF;
-    cdb[6] = (alloc >> 16) & 0xFF;
-    cdb[7] = (alloc >> 8) & 0xFF;
-    cdb[8] = alloc & 0xFF;
+    (void)build_read_element_status_cdb(0x00, 0, 0xFFFF, alloc, cdb);
 
     uint8_t *buf = calloc(1, alloc);
     if (!buf) return -1;
@@ -2114,7 +2117,8 @@ static int read_element_status_info(ChangerHandle *handle, uint16_t drive_addr, 
     return 0;
 }
 
-static int cmd_move_medium(ChangerHandle *handle, uint16_t transport, uint16_t source, uint16_t dest) {
+static int cmd_move_medium(ChangerHandle *handle, uint16_t transport,
+                           uint16_t source, uint16_t dest) {
     uint8_t cdb[12] = {0};
     if (build_move_medium_cdb(transport, source, dest, cdb) != MCHANGER_OK) {
         return 1;
@@ -2214,9 +2218,9 @@ static bool fetch_compact_element_map(ChangerHandle *handle, ElementMap *map) {
     cdb[1] = 0x00; // all element types
     cdb[4] = 0xFF;
     cdb[5] = 0xFF;
-    cdb[6] = (alloc >> 16) & 0xFF;
-    cdb[7] = (alloc >> 8) & 0xFF;
-    cdb[8] = alloc & 0xFF;
+    cdb[7] = (alloc >> 16) & 0xFF;
+    cdb[8] = (alloc >> 8) & 0xFF;
+    cdb[9] = alloc & 0xFF;
 
     int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc,
                          kSCSIDataTransfer_FromTargetToInitiator, 30000);
@@ -2286,9 +2290,9 @@ static int fetch_element_map(ChangerHandle *handle, ElementMap *map) {
     cdb[3] = 0x00; // starting element address (low)
     cdb[4] = 0xFF; // number of elements (high) - request maximum
     cdb[5] = 0xFF; // number of elements (low)
-    cdb[6] = (alloc >> 16) & 0xFF;
-    cdb[7] = (alloc >> 8) & 0xFF;
-    cdb[8] = alloc & 0xFF;
+    cdb[7] = (alloc >> 16) & 0xFF;
+    cdb[8] = (alloc >> 8) & 0xFF;
+    cdb[9] = alloc & 0xFF;
 
     int rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 60000);
     if (rc != 0) {
@@ -2328,9 +2332,9 @@ static int fetch_element_map(ChangerHandle *handle, ElementMap *map) {
             cdb[3] = start_addr & 0xFF;
             cdb[4] = (remaining >> 8) & 0xFF;
             cdb[5] = remaining & 0xFF;
-            cdb[6] = (alloc >> 16) & 0xFF;
-            cdb[7] = (alloc >> 8) & 0xFF;
-            cdb[8] = alloc & 0xFF;
+            cdb[7] = (alloc >> 16) & 0xFF;
+            cdb[8] = (alloc >> 8) & 0xFF;
+            cdb[9] = alloc & 0xFF;
 
             memset(buf, 0, alloc);
             rc = execute_cdb(handle, cdb, sizeof(cdb), buf, alloc, kSCSIDataTransfer_FromTargetToInitiator, 60000);
@@ -3585,6 +3589,110 @@ int mchanger_get_drive_status(MChangerHandle *changer, int drive, MChangerElemen
     return MCHANGER_OK;
 }
 
+int mchanger_get_ie_status(MChangerHandle *changer, int ie,
+                           MChangerElementStatus *out_status) {
+    if (!changer || !out_status || ie < 1) return MCHANGER_ERR_INVALID;
+
+    int rc = ensure_element_cache(changer);
+    if (rc != MCHANGER_OK) return rc;
+    if ((size_t)ie > changer->element_cache.ie.count) {
+        return MCHANGER_ERR_INVALID;
+    }
+
+    uint16_t address = changer->element_cache.ie.addrs[ie - 1];
+    ElementStatus status = {0};
+    if (read_element_status_info(&changer->internal, address, &status,
+                                 0, NULL) != 0) {
+        return MCHANGER_ERR_SCSI;
+    }
+
+    out_status->address = address;
+    out_status->full = status.full;
+    out_status->except = false;
+    out_status->valid_source = status.valid_src;
+    out_status->source_addr = status.src_addr;
+    return MCHANGER_OK;
+}
+
+static int parse_bulk_status_report(
+    const uint8_t *buf,
+    size_t buffer_length,
+    uint16_t request_start,
+    const uint16_t *slot_addrs,
+    size_t slot_count,
+    uint16_t drive_addr,
+    MChangerElementStatus *out_drive,
+    MChangerElementStatus *out_slots,
+    bool *io_drive_supported,
+    uint16_t *out_next_start
+) {
+    if (!buf || buffer_length < 8 || !out_slots || !out_next_start) {
+        return MCHANGER_ERR_INVALID;
+    }
+
+    uint32_t report_bytes = ((uint32_t)buf[5] << 16)
+        | ((uint32_t)buf[6] << 8) | buf[7];
+    size_t parse_length = buffer_length;
+    size_t reported_length = (size_t)report_bytes + 8;
+    if (reported_length < parse_length) parse_length = reported_length;
+
+    uint32_t next = request_start;
+    size_t offset = 8;
+    while (offset + 8 <= parse_length) {
+        uint8_t element_type = buf[offset];
+        uint16_t descriptor_length = ((uint16_t)buf[offset + 2] << 8)
+            | buf[offset + 3];
+        uint32_t page_bytes = ((uint32_t)buf[offset + 5] << 16)
+            | ((uint32_t)buf[offset + 6] << 8) | buf[offset + 7];
+        offset += 8;
+
+        if (descriptor_length < 3 || page_bytes == 0) break;
+        size_t page_end = page_bytes > SIZE_MAX - offset
+            ? parse_length : offset + page_bytes;
+        if (page_end > parse_length) page_end = parse_length;
+        if (element_type == 0x04 && io_drive_supported) {
+            *io_drive_supported = true;
+        }
+
+        while (descriptor_length <= page_end - offset) {
+            uint16_t address = ((uint16_t)buf[offset] << 8) | buf[offset + 1];
+            uint8_t flags = buf[offset + 2];
+            bool valid_source = descriptor_length >= 12
+                && (buf[offset + 9] & 0x80) != 0;
+            uint16_t source = valid_source
+                ? (((uint16_t)buf[offset + 10] << 8) | buf[offset + 11]) : 0;
+
+            /* The XL1B returns at most one chunk per request and terminates
+               intermediate chunks with an all-zero descriptor. Ignore that
+               sentinel while retaining the address after the last real
+               descriptor as the next request start. */
+            if (address >= next) {
+                next = address == UINT16_MAX ? UINT16_MAX : (uint32_t)address + 1;
+            }
+
+            if (out_drive && drive_addr != 0 && address == drive_addr) {
+                out_drive->full = (flags & 0x01) != 0;
+                out_drive->except = (flags & 0x80) != 0;
+                out_drive->valid_source = valid_source;
+                out_drive->source_addr = source;
+            }
+            for (size_t i = 0; i < slot_count; i++) {
+                if (slot_addrs[i] != address) continue;
+                out_slots[i].full = (flags & 0x01) != 0;
+                out_slots[i].except = (flags & 0x80) != 0;
+                out_slots[i].valid_source = valid_source;
+                out_slots[i].source_addr = source;
+                break;
+            }
+            offset += descriptor_length;
+        }
+        if (offset < page_end) offset = page_end;
+    }
+
+    *out_next_start = (uint16_t)next;
+    return MCHANGER_OK;
+}
+
 int mchanger_get_bulk_status(MChangerHandle *changer,
                              const uint16_t *slot_addrs,
                              size_t slot_count,
@@ -3596,132 +3704,91 @@ int mchanger_get_bulk_status(MChangerHandle *changer,
     if (slot_count > 0 && !slot_addrs) return MCHANGER_ERR_INVALID;
 
     if (out_drive_supported) *out_drive_supported = false;
-
-    /* Initialize outputs to "empty/unknown" */
     for (size_t i = 0; i < slot_count; i++) {
-        out_slots[i].address = slot_addrs[i];
-        out_slots[i].full = false;
-        out_slots[i].except = false;
-        out_slots[i].valid_source = false;
-        out_slots[i].source_addr = 0;
+        out_slots[i] = (MChangerElementStatus) {
+            .address = slot_addrs[i],
+            /* Stay fail-closed until this exact address is reported. */
+            .except = true
+        };
     }
-
     if (out_drive) {
-        out_drive->address = drive_addr;
-        out_drive->full = false;
-        out_drive->except = false;
-        out_drive->valid_source = false;
-        out_drive->source_addr = 0;
+        *out_drive = (MChangerElementStatus) { .address = drive_addr };
     }
 
-    uint32_t alloc = 4096;
-    uint8_t cdb[12] = {0};
-    cdb[0] = 0xB8; // READ ELEMENT STATUS
-    cdb[1] = 0x00; // all element types
-    cdb[4] = 0xFF;
-    cdb[5] = 0xFF;
-    cdb[6] = (alloc >> 16) & 0xFF;
-    cdb[7] = (alloc >> 8) & 0xFF;
-    cdb[8] = alloc & 0xFF;
-
-    uint8_t *buf = calloc(1, alloc);
-    if (!buf) return MCHANGER_ERR_INVALID;
-
-    int rc = execute_cdb(&changer->internal, cdb, sizeof(cdb), buf, alloc,
-                         kSCSIDataTransfer_FromTargetToInitiator, 30000);
-    if (rc != 0) {
-        free(buf);
-        return MCHANGER_ERR_SCSI;
+    uint16_t last_target = drive_addr;
+    for (size_t i = 0; i < slot_count; i++) {
+        if (slot_addrs[i] > last_target) last_target = slot_addrs[i];
     }
 
-    uint32_t report_bytes = (buf[5] << 16) | (buf[6] << 8) | buf[7];
-    uint32_t needed = report_bytes > 0 ? report_bytes + 8 : 0;
-    if (needed > alloc && needed < 65535) {
-        free(buf);
-        alloc = needed;
-        buf = calloc(1, alloc);
+    uint16_t start = 0;
+    size_t request_limit = slot_count + 8;
+    for (size_t request = 0; request < request_limit && start <= last_target; request++) {
+        uint32_t remaining = (uint32_t)last_target - start + 1;
+        uint16_t count = remaining > UINT16_MAX ? UINT16_MAX : (uint16_t)remaining;
+        uint32_t allocation_length = 4096;
+        uint8_t cdb[12] = {0};
+        uint8_t *buf = calloc(1, allocation_length);
         if (!buf) return MCHANGER_ERR_INVALID;
-        cdb[6] = (alloc >> 16) & 0xFF;
-        cdb[7] = (alloc >> 8) & 0xFF;
-        cdb[8] = alloc & 0xFF;
 
-        rc = execute_cdb(&changer->internal, cdb, sizeof(cdb), buf, alloc,
-                         kSCSIDataTransfer_FromTargetToInitiator, 30000);
+        (void)build_read_element_status_cdb(0x00, start, count,
+                                            allocation_length, cdb);
+        int rc = execute_cdb(&changer->internal, cdb, sizeof(cdb), buf,
+                             allocation_length,
+                             kSCSIDataTransfer_FromTargetToInitiator, 30000);
         if (rc != 0) {
             free(buf);
             return MCHANGER_ERR_SCSI;
         }
-        report_bytes = (buf[5] << 16) | (buf[6] << 8) | buf[7];
-    }
 
-    uint32_t parse_len = alloc;
-    if (report_bytes > 0 && report_bytes + 8 < parse_len) {
-        parse_len = report_bytes + 8;
-    }
-    if (parse_len < 8) {
+        uint32_t report_bytes = ((uint32_t)buf[5] << 16)
+            | ((uint32_t)buf[6] << 8) | buf[7];
+        uint32_t needed = report_bytes <= UINT32_MAX - 8 ? report_bytes + 8 : 0;
+        if (needed > allocation_length && needed <= 1024 * 1024) {
+            free(buf);
+            allocation_length = needed;
+            buf = calloc(1, allocation_length);
+            if (!buf) return MCHANGER_ERR_INVALID;
+            (void)build_read_element_status_cdb(0x00, start, count,
+                                                allocation_length, cdb);
+            rc = execute_cdb(&changer->internal, cdb, sizeof(cdb), buf,
+                             allocation_length,
+                             kSCSIDataTransfer_FromTargetToInitiator, 30000);
+            if (rc != 0) {
+                free(buf);
+                return MCHANGER_ERR_SCSI;
+            }
+        }
+
+        uint16_t next = start;
+        rc = parse_bulk_status_report(
+            buf, allocation_length, start, slot_addrs, slot_count, drive_addr,
+            out_drive, out_slots, out_drive_supported, &next);
         free(buf);
-        return MCHANGER_OK;
+        if (rc != MCHANGER_OK) return rc;
+        if (next <= start) break;
+        start = next;
     }
-
-    bool drive_page_present = false;
-
-    /* Parse element status pages (same wire format as read_element_status_info()) */
-    uint32_t offset = 8;
-    while (offset + 8 <= parse_len) {
-        uint8_t elem_type = buf[offset];
-        uint16_t desc_len = (buf[offset + 2] << 8) | buf[offset + 3];
-        uint32_t page_bytes = (buf[offset + 5] << 16) | (buf[offset + 6] << 8) | buf[offset + 7];
-        offset += 8;
-
-        if (desc_len == 0 || page_bytes == 0) break;
-
-        uint32_t page_end = offset + page_bytes;
-        if (page_end > parse_len) page_end = parse_len;
-
-        if (elem_type == 0x04) {
-            drive_page_present = true;
-        }
-
-        while (offset + desc_len <= page_end) {
-            uint16_t elem_addr = (buf[offset] << 8) | buf[offset + 1];
-            uint8_t elem_flags = buf[offset + 2];
-            bool full = (elem_flags & 0x01) != 0;
-
-            bool svalid = false;
-            uint16_t src = 0;
-            if (desc_len >= 12) {
-                svalid = (buf[offset + 9] & 0x80) != 0;
-                src = (buf[offset + 10] << 8) | buf[offset + 11];
-            }
-
-            if (out_drive && drive_addr != 0 && elem_addr == drive_addr) {
-                out_drive->full = full;
-                out_drive->valid_source = svalid;
-                out_drive->source_addr = src;
-            }
-
-            /* Fill any matching slot entry */
-            for (size_t i = 0; i < slot_count; i++) {
-                if (slot_addrs[i] == elem_addr) {
-                    out_slots[i].full = full;
-                    out_slots[i].valid_source = svalid;
-                    out_slots[i].source_addr = src;
-                    break;
-                }
-            }
-
-            offset += desc_len;
-        }
-
-        if (offset < page_end) {
-            offset = page_end;
-        }
-    }
-
-    if (out_drive_supported) *out_drive_supported = drive_page_present;
-    free(buf);
     return MCHANGER_OK;
 }
+
+#ifdef MCHANGER_TESTING
+int mchanger_test_parse_bulk_status_report(
+    const uint8_t *buffer,
+    size_t buffer_length,
+    uint16_t request_start,
+    const uint16_t *slot_addrs,
+    size_t slot_count,
+    uint16_t drive_addr,
+    MChangerElementStatus *out_drive,
+    MChangerElementStatus *out_slots,
+    bool *io_drive_supported,
+    uint16_t *out_next_start
+) {
+    return parse_bulk_status_report(
+        buffer, buffer_length, request_start, slot_addrs, slot_count,
+        drive_addr, out_drive, out_slots, io_drive_supported, out_next_start);
+}
+#endif
 
 int mchanger_initialize_element_status(MChangerHandle *changer) {
     if (!changer) return MCHANGER_ERR_INVALID;
